@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""CLI entry point — cve-agent-spec.md §10.
+
+Phase 1: scan (known CVE pipeline only), report, status.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+
+import click
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.table import Table
+
+from output.reporter import generate_report, write_report
+from pipelines.known_cve import load_watchlist, run_known_cve_pipeline
+from state.db import DEFAULT_DB_PATH, get_db, log_scan, status_summary
+
+load_dotenv()
+console = Console()
+
+
+def _filter_packages(packages: list[dict], names: tuple[str, ...], layer: str | None) -> list[dict]:
+    filtered = packages
+    if names:
+        wanted = set(names)
+        filtered = [p for p in filtered if p["name"] in wanted]
+    if layer:
+        filtered = [p for p in filtered if p["layer"] == layer]
+    return filtered
+
+
+@click.group()
+def cli() -> None:
+    """AI/Agentic CVE Research Agent — static vulnerability research pipeline."""
+
+
+@cli.command()
+@click.option("--packages", "package_names", multiple=True, help="Scan specific packages only")
+@click.option(
+    "--layer",
+    type=click.Choice(["framework", "sdk", "mcp", "infrastructure"]),
+    default=None,
+    help="Scan one layer only",
+)
+@click.option("--dry-run", is_flag=True, help="Run the pipeline but do not write findings to the database")
+def scan(package_names: tuple[str, ...], layer: str | None, dry_run: bool) -> None:
+    """Run the known CVE pipeline (NVD + OSV.dev + GHSA) for watchlist packages."""
+    watchlist = load_watchlist()
+    targets = _filter_packages(watchlist, package_names, layer)
+    if not targets:
+        console.print("[yellow]No packages matched the given filters.[/yellow]")
+        return
+
+    github_token = os.environ.get("GITHUB_TOKEN")
+    nvd_api_key = os.environ.get("NVD_API_KEY")
+    if not github_token:
+        console.print("[yellow]warning:[/yellow] GITHUB_TOKEN not set — GHSA source will be skipped for this run.")
+    if not nvd_api_key:
+        console.print(
+            "[yellow]warning:[/yellow] NVD_API_KEY not set — NVD queries run at the unauthenticated rate limit (slower)."
+        )
+
+    db = get_db()
+    console.print(f"Scanning {len(targets)} package(s) against NVD, OSV.dev, and GHSA...")
+    start = time.monotonic()
+    result = asyncio.run(
+        run_known_cve_pipeline(
+            targets,
+            db=db,
+            github_token=github_token,
+            nvd_api_key=nvd_api_key,
+            dry_run=dry_run,
+        )
+    )
+    duration = time.monotonic() - start
+
+    log_scan(
+        db,
+        mode="scan",
+        packages_scanned=result.packages_scanned,
+        findings_new=result.findings_new,
+        duration_seconds=duration,
+    )
+
+    suffix = " (dry run — not written to database)" if dry_run else ""
+    console.print(
+        f"[green]Done.[/green] {result.packages_scanned} package(s) scanned, "
+        f"{result.findings_new} new finding(s){suffix} in {duration:.1f}s."
+    )
+
+
+@cli.command()
+@click.option("--output", "output_path", default=None, help="Report output path (default: reports/YYYY-MM-DD.md)")
+def report(output_path: str | None) -> None:
+    """Generate a Markdown report from the current database state."""
+    db = get_db()
+    summary = status_summary(db)
+    content = generate_report(
+        db,
+        mode="report",
+        packages_scanned=len(load_watchlist()),
+        findings_new=summary["total_findings"],
+    )
+    path = write_report(content, output_path)
+    console.print(f"[green]Report written to[/green] {path}")
+
+
+@cli.command()
+def status() -> None:
+    """Print a summary of finding counts by lane and status."""
+    db = get_db()
+    summary = status_summary(db)
+
+    console.print(f"Database: {DEFAULT_DB_PATH}")
+    console.print(f"Total findings: {summary['total_findings']}")
+
+    lane_table = Table(title="By lane")
+    lane_table.add_column("Lane")
+    lane_table.add_column("Count", justify="right")
+    for lane, count in sorted(summary["by_lane"].items()):
+        lane_table.add_row(lane, str(count))
+    console.print(lane_table)
+
+    status_table = Table(title="By status")
+    status_table.add_column("Status")
+    status_table.add_column("Count", justify="right")
+    for status_name, count in sorted(summary["by_status"].items()):
+        status_table.add_row(status_name, str(count))
+    console.print(status_table)
+
+
+@cli.command(name="watchlist")
+def watchlist_cmd() -> None:
+    """List all watchlist packages with their layer and enabled status."""
+    table = Table(title="Watchlist")
+    table.add_column("Name")
+    table.add_column("Ecosystem")
+    table.add_column("Layer")
+    table.add_column("Repo")
+    table.add_column("Enabled")
+    for pkg in load_watchlist():
+        table.add_row(
+            pkg["name"],
+            pkg["ecosystem"],
+            pkg["layer"],
+            pkg.get("repo") or "—",
+            "yes" if pkg.get("enabled", True) else "no",
+        )
+    console.print(table)
+
+
+if __name__ == "__main__":
+    cli()

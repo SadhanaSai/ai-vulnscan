@@ -61,6 +61,22 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# cve-finder-agent state DB (state/db.py) — local research state, not shared
+state/*.db
+state/*.db-journal
+state/*.db-wal
+state/*.db-shm
+
+# cve-finder-agent: internal planning docs and generated reports — never push.
+# Reports can contain Lane 1A (unpatched, undisclosed) findings, which the
+# responsible-disclosure constraint (CLAUDE.md) forbids surfacing publicly
+# before the 90-day deadline. CLAUDE.md/cve-agent-spec.md are working docs,
+# not meant for the public repo either.
+CLAUDE.md
+cve-agent-spec.md
+reports/*.md
+!reports/.gitkeep
+
 # Flask stuff:
 instance/
 .webassets-cache

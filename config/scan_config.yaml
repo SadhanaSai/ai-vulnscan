@@ -1,0 +1,75 @@
+# Scan configuration — cve-agent-spec.md §7a (llm) and CLAUDE.md (vulnerability classes)
+
+# Vulnerability classes — used by the AST pre-filter in the pattern hunter
+# (Phase 5) and by --classes/--exclude-classes CLI filtering. Each class has
+# a keyword list used to pre-filter commits/issues/PRs and source files
+# before anything reaches an LLM.
+vulnerability_classes:
+  path_traversal:
+    enabled: true
+    cwe: ["CWE-22"]
+    keywords: ["path traversal", "directory traversal", "..%2f", "realpath", "os.path.join"]
+  command_injection:
+    enabled: true
+    cwe: ["CWE-78"]
+    keywords: ["command injection", "shell injection", "subprocess", "os.system", "shell=True"]
+  sql_injection:
+    enabled: true
+    cwe: ["CWE-89"]
+    keywords: ["sql injection", "sqli", "parameterized query", "raw sql"]
+  deserialization:
+    enabled: true
+    cwe: ["CWE-502"]
+    keywords: ["deserialization", "pickle", "unpickle", "yaml.load", "unsafe load"]
+  prompt_injection:
+    enabled: true
+    cwe: ["CWE-74"]
+    keywords: ["prompt injection", "jailbreak", "system prompt leak", "indirect injection"]
+  tool_poisoning:
+    enabled: true
+    cwe: ["CWE-1287"]
+    keywords: ["tool poisoning", "tool description", "malicious tool", "mcp tool"]
+  supply_chain:
+    enabled: true
+    cwe: ["CWE-829"]
+    keywords: ["supply chain", "typosquat", "malicious package", "compromised dependency"]
+  credential_exposure:
+    enabled: true
+    cwe: ["CWE-312"]
+    keywords: ["credential exposure", "api key leak", "hardcoded secret", "plaintext credential"]
+  ssrf:
+    enabled: true
+    cwe: ["CWE-918"]
+    keywords: ["ssrf", "server-side request forgery", "internal metadata endpoint"]
+  arbitrary_file_rw:
+    enabled: true
+    cwe: ["CWE-73"]
+    keywords: ["arbitrary file write", "arbitrary file read", "path validation", "file write vulnerability"]
+  agent_state_deserialization:
+    enabled: true
+    cwe: ["CWE-502"]
+    keywords: ["agent state", "memory deserialization", "checkpoint load", "session deserialization"]
+  rug_pull:
+    enabled: true
+    cwe: ["CWE-1287"]
+    keywords: ["rug pull", "tool definition change", "silent tool update", "mcp server compromise"]
+
+# LLM provider routing — cve-agent-spec.md §7a
+# No effect until Phase 2 (llm/router.py). Any provider value can be swapped
+# to "ollama" with a locally-pulled model name for fully offline operation.
+# CLI flags --llm-provider / --llm-model override these for a single run.
+llm:
+  triage: # Phases 2-3
+    provider: groq
+    model: llama-3.3-70b-versatile
+  pattern_extraction: # Phase 4
+    provider: claude
+    model: claude-sonnet-4-6
+  pattern_hunt: # Phase 5
+    provider: claude
+    model: claude-sonnet-4-6
+  cve_drafting: # Phase 6
+    provider: claude
+    model: claude-sonnet-4-6
+  ollama:
+    base_url: http://localhost:11434/v1 # override via OLLAMA_HOST env var

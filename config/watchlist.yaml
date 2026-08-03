@@ -1,0 +1,257 @@
+# Package watchlist — cve-agent-spec.md §3
+#
+# layer: "framework" | "sdk" | "mcp" | "infrastructure"
+# ecosystem: "pypi" | "npm"
+# repo: GitHub "org/repo" used for commit/issue/PR/GHSA lookups
+# agentic_context: optional free-text used by the LLM to write sharper
+#   CVE descriptions and agentic-uplift analysis (Phases 2+)
+# enabled: false packages are skipped by all pipelines but stay listed here
+
+packages:
+  # --- Layer 1: AI Frameworks ---
+  - name: langchain
+    ecosystem: pypi
+    layer: framework
+    repo: langchain-ai/langchain
+    agentic_context: null
+    enabled: true
+  - name: langchain-core
+    ecosystem: pypi
+    layer: framework
+    repo: langchain-ai/langchain
+    agentic_context: null
+    enabled: true
+  - name: langchain-community
+    ecosystem: pypi
+    layer: framework
+    repo: langchain-ai/langchain
+    agentic_context: null
+    enabled: true
+  - name: langchain-experimental
+    ecosystem: pypi
+    layer: framework
+    repo: langchain-ai/langchain
+    agentic_context: null
+    enabled: true
+  - name: llama-index
+    ecosystem: pypi
+    layer: framework
+    repo: run-llama/llama_index
+    agentic_context: null
+    enabled: true
+  - name: llama-index-core
+    ecosystem: pypi
+    layer: framework
+    repo: run-llama/llama_index
+    agentic_context: null
+    enabled: true
+  - name: crewai
+    ecosystem: pypi
+    layer: framework
+    repo: crewAIInc/crewAI
+    agentic_context: null
+    enabled: true
+  - name: autogen
+    ecosystem: pypi
+    layer: framework
+    repo: microsoft/autogen
+    agentic_context: null
+    enabled: true
+  - name: autogen-agentchat
+    ecosystem: pypi
+    layer: framework
+    repo: microsoft/autogen
+    agentic_context: null
+    enabled: true
+  - name: haystack-ai
+    ecosystem: pypi
+    layer: framework
+    repo: deepset-ai/haystack
+    agentic_context: null
+    enabled: true
+  - name: smolagents
+    ecosystem: pypi
+    layer: framework
+    repo: huggingface/smolagents
+    agentic_context: null
+    enabled: true
+  - name: pydantic-ai
+    ecosystem: pypi
+    layer: framework
+    repo: pydantic/pydantic-ai
+    agentic_context: null
+    enabled: true
+  - name: dspy-ai
+    ecosystem: pypi
+    layer: framework
+    repo: stanfordnlp/dspy
+    agentic_context: null
+    enabled: true
+  - name: litellm
+    ecosystem: pypi
+    layer: framework
+    repo: BerriAI/litellm
+    agentic_context: null
+    enabled: true
+  - name: langflow
+    ecosystem: pypi
+    layer: framework
+    repo: logspace-ai/langflow
+    agentic_context: null
+    enabled: true
+
+  # --- Layer 2: AI SDKs and clients ---
+  - name: anthropic
+    ecosystem: pypi
+    layer: sdk
+    repo: anthropics/anthropic-sdk-python
+    agentic_context: null
+    enabled: true
+  - name: openai
+    ecosystem: pypi
+    layer: sdk
+    repo: openai/openai-python
+    agentic_context: null
+    enabled: true
+  - name: google-generativeai
+    ecosystem: pypi
+    layer: sdk
+    repo: google-gemini/generative-ai-python
+    agentic_context: null
+    enabled: true
+  - name: mistralai
+    ecosystem: pypi
+    layer: sdk
+    repo: mistralai/client-python
+    agentic_context: null
+    enabled: true
+  - name: cohere
+    ecosystem: pypi
+    layer: sdk
+    repo: cohere-ai/cohere-python
+    agentic_context: null
+    enabled: true
+  - name: boto3
+    ecosystem: pypi
+    layer: sdk
+    repo: boto/boto3
+    agentic_context: "Bedrock client context — used to call Bedrock-hosted models"
+    enabled: true
+  - name: azure-ai-inference
+    ecosystem: pypi
+    layer: sdk
+    repo: Azure/azure-sdk-for-python
+    agentic_context: null
+    enabled: true
+
+  # --- Layer 3: MCP ecosystem ---
+  - name: mcp
+    ecosystem: pypi
+    layer: mcp
+    repo: modelcontextprotocol/python-sdk
+    agentic_context: null
+    enabled: true
+  - name: "@modelcontextprotocol/sdk"
+    ecosystem: npm
+    layer: mcp
+    repo: modelcontextprotocol/typescript-sdk
+    agentic_context: null
+    enabled: true
+  - name: "@modelcontextprotocol/inspector"
+    ecosystem: npm
+    layer: mcp
+    repo: modelcontextprotocol/inspector
+    agentic_context: null
+    enabled: true
+  - name: mcp-server-filesystem
+    ecosystem: npm
+    layer: mcp
+    repo: modelcontextprotocol/servers
+    agentic_context: null
+    enabled: true
+  - name: mcp-server-git
+    ecosystem: npm
+    layer: mcp
+    repo: modelcontextprotocol/servers
+    agentic_context: null
+    enabled: true
+  - name: mcp-server-github
+    ecosystem: npm
+    layer: mcp
+    repo: modelcontextprotocol/servers
+    agentic_context: null
+    enabled: true
+  - name: mcp-server-slack
+    ecosystem: npm
+    layer: mcp
+    repo: modelcontextprotocol/servers
+    agentic_context: null
+    enabled: true
+  - name: mcp-server-postgres
+    ecosystem: npm
+    layer: mcp
+    repo: modelcontextprotocol/servers
+    agentic_context: null
+    enabled: true
+  - name: mcp-remote
+    ecosystem: npm
+    layer: mcp
+    repo: modelcontextprotocol/mcp-remote
+    agentic_context: null
+    enabled: true
+
+  # --- Layer 4: Agentic infrastructure ---
+  - name: chromadb
+    ecosystem: pypi
+    layer: infrastructure
+    repo: chroma-core/chroma
+    agentic_context: "RAG vector store used in LangChain, LlamaIndex"
+    enabled: true
+  - name: faiss-cpu
+    ecosystem: pypi
+    layer: infrastructure
+    repo: facebookresearch/faiss
+    agentic_context: "Embedding search layer in RAG pipelines"
+    enabled: true
+  - name: qdrant-client
+    ecosystem: pypi
+    layer: infrastructure
+    repo: qdrant/qdrant-client
+    agentic_context: "Vector store used in agentic retrieval"
+    enabled: true
+  - name: weaviate-client
+    ecosystem: pypi
+    layer: infrastructure
+    repo: weaviate/weaviate-python-client
+    agentic_context: "Vector store used in agentic retrieval"
+    enabled: true
+  - name: e2b
+    ecosystem: pypi
+    layer: infrastructure
+    repo: e2b-dev/e2b-python
+    agentic_context: "Sandboxed code execution for code agents"
+    enabled: true
+  - name: docker
+    ecosystem: pypi
+    layer: infrastructure
+    repo: docker/docker-py
+    agentic_context: "Container execution used by code agents"
+    enabled: true
+  - name: httpx
+    ecosystem: pypi
+    layer: infrastructure
+    repo: encode/httpx
+    agentic_context: "Async HTTP used in tool calls"
+    enabled: true
+  - name: aiohttp
+    ecosystem: pypi
+    layer: infrastructure
+    repo: aio-libs/aiohttp
+    agentic_context: "Async HTTP used in tool calls"
+    enabled: true
+  - name: celery
+    ecosystem: pypi
+    layer: infrastructure
+    repo: celery/celery
+    agentic_context: "Task queue used for agent orchestration"
+    enabled: true
