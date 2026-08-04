@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx
 import yaml
+from packaging.version import InvalidVersion, Version
 
 from pipelines.http_utils import RateLimiter, console, request_with_retry
 from state.db import PROJECT_ROOT, Finding, make_finding_id, upsert_finding
@@ -102,6 +103,10 @@ async def query_osv(client: httpx.AsyncClient, package: str, ecosystem: str) -> 
                 "cvss": None,
                 "cwe": cwe,
                 "signal_url": fix_url or f"https://osv.dev/vulnerability/{v.get('id')}",
+                # kept for cross_check_existing_cve()'s version-range and
+                # commit-SHA matching — not used by the known-CVE pipeline itself
+                "affected": v.get("affected", []),
+                "references": [r["url"] for r in v.get("references", []) if r.get("url")],
             }
         )
     return results
@@ -232,6 +237,10 @@ async def query_ghsa(client: httpx.AsyncClient, package: str, ecosystem: str, *,
                 "cvss": (advisory.get("cvss") or {}).get("score"),
                 "cwe": cwe,
                 "signal_url": refs[0]["url"] if refs else f"https://github.com/advisories/{advisory.get('ghsaId')}",
+                # kept for cross_check_existing_cve()'s version-range and
+                # commit-SHA matching — not used by the known-CVE pipeline itself
+                "vulnerable_version_range": node.get("vulnerableVersionRange"),
+                "references": [r["url"] for r in refs if r.get("url")],
             }
         )
     return results
@@ -260,6 +269,114 @@ def _merge_by_cve(*result_lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if not existing.get("cwe") and r.get("cwe"):
                 existing["cwe"] = r["cwe"]
     return list(merged.values())
+
+
+_RANGE_CLAUSE_RE = re.compile(r"(>=|<=|>|<|=)\s*([\w.\-+]+)")
+
+
+def _commit_sha_in_refs(commit_sha: str, references: list[str]) -> bool:
+    return any(commit_sha in ref for ref in references)
+
+
+def _version_in_osv_ranges(version: str, affected: list[dict[str, Any]]) -> bool:
+    """True if `version` is listed exactly, or falls within an
+    introduced/fixed bound, in an OSV `affected[]` entry. Any parse failure
+    is treated as no-match — conservative, since a missed match here just
+    means the signal proceeds to triage as normal (safe), while a false
+    match would wrongly suppress a real finding (unsafe)."""
+    try:
+        target = Version(version)
+    except InvalidVersion:
+        return False
+    for entry in affected:
+        if version in entry.get("versions", []):
+            return True
+        for rng in entry.get("ranges", []):
+            introduced = next((e["introduced"] for e in rng.get("events", []) if "introduced" in e), None)
+            fixed = next((e["fixed"] for e in rng.get("events", []) if "fixed" in e), None)
+            try:
+                if introduced and introduced != "0" and target < Version(introduced):
+                    continue
+                if fixed and target >= Version(fixed):
+                    continue
+            except InvalidVersion:
+                continue
+            return True
+    return False
+
+
+def _version_satisfies_range_string(version: str, range_str: str | None) -> bool:
+    """True if `version` satisfies a GHSA-style range string, e.g. '>= 1.0.0, < 2.0.0'."""
+    if not range_str:
+        return False
+    try:
+        target = Version(version)
+    except InvalidVersion:
+        return False
+    clauses = _RANGE_CLAUSE_RE.findall(range_str)
+    if not clauses:
+        return False
+    for op, bound in clauses:
+        try:
+            bound_v = Version(bound)
+        except InvalidVersion:
+            return False
+        satisfied = {
+            ">=": target >= bound_v,
+            ">": target > bound_v,
+            "<=": target <= bound_v,
+            "<": target < bound_v,
+            "=": target == bound_v,
+        }[op]
+        if not satisfied:
+            return False
+    return True
+
+
+async def cross_check_existing_cve(
+    package: str,
+    ecosystem: str,
+    repo: str | None = None,
+    commit_sha: str | None = None,
+    version: str | None = None,
+    *,
+    client: httpx.AsyncClient | None = None,
+    github_token: str | None = None,
+) -> str | None:
+    """cve-agent-spec.md §8.2a / §8.6 — query OSV.dev + GHSA (the same
+    sources §8.1 already queries, reused rather than duplicated) for an
+    existing CVE that could plausibly cover this pre-CVE signal, so it never
+    gets triaged into Lane 1A/1B when a CVE for the same issue was actually
+    assigned days or weeks ago. Called before triage (§8.2a) and again,
+    fresh, immediately before a finding may become `ready_to_file` (§8.6) —
+    callers must not cache or skip this.
+
+    Matches on a fix-commit reference (highest confidence) or an
+    affected-version-range overlap. Returns the matched CVE id, or None.
+    `repo` is accepted for signature parity with the signal shape but isn't
+    needed here — OSV/GHSA are already queried by package+ecosystem, not repo.
+    """
+
+    async def _run(c: httpx.AsyncClient) -> str | None:
+        osv_results, ghsa_results = await asyncio.gather(
+            query_osv(c, package, ecosystem),
+            query_ghsa(c, package, ecosystem, token=github_token),
+        )
+        for result in (*osv_results, *ghsa_results):
+            if not result.get("cve_id"):
+                continue
+            if commit_sha and _commit_sha_in_refs(commit_sha, result.get("references", [])):
+                return result["cve_id"]
+            if version and _version_in_osv_ranges(version, result.get("affected") or []):
+                return result["cve_id"]
+            if version and _version_satisfies_range_string(version, result.get("vulnerable_version_range")):
+                return result["cve_id"]
+        return None
+
+    if client is not None:
+        return await _run(client)
+    async with httpx.AsyncClient(timeout=30.0) as new_client:
+        return await _run(new_client)
 
 
 @dataclass

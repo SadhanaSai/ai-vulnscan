@@ -1,11 +1,11 @@
 """Markdown report generator — cve-agent-spec.md §11.
 
-Phase 1 only populates the CONFIRMED CVEs section, from known-CVE findings
-(lane="known"). READY TO FILE / WATCH QUEUE / PATTERN LIBRARY DELTA /
-DISCLOSURE TRACKER render as explicit placeholders until the phases that
-populate them (triage, watch queue, pattern extraction, CVE drafter) exist —
-an empty table would look like "we scanned and found nothing" instead of
-"this feature isn't built yet."
+CONFIRMED CVEs (known-CVE findings) and READY TO FILE (Lane 1, via
+triage/classifier.py) are populated as of Phase 2. WATCH QUEUE / PATTERN
+LIBRARY DELTA / DISCLOSURE TRACKER still render as explicit placeholders
+until the phases that populate them (watch queue re-check scheduling,
+pattern extraction, CVE drafter) exist — an empty table would look like "we
+scanned and found nothing" instead of "this feature isn't built yet."
 """
 
 from __future__ import annotations
@@ -75,10 +75,7 @@ def _confirmed_cves_section(findings: list[Finding]) -> str:
 def _ready_to_file_section(findings: list[Finding]) -> str:
     lines = ["## READY TO FILE (Lane 1 — Human review required)", ""]
     if not findings:
-        lines.append(
-            "_No Lane 1 findings yet — pre-CVE triage isn't built until Phase 2 "
-            "(`triage/classifier.py`). This section will populate once that phase lands._"
-        )
+        lines.append("_No Lane 1 findings from this run._")
         return "\n".join(lines)
     for f in findings:
         lines.append(f"### [{f.id[:12]}] Package: {f.package} | Severity: {f.severity or 'UNKNOWN'} | {', '.join(f.cwe) or 'CWE-?'}")

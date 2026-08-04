@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """CLI entry point — cve-agent-spec.md §10.
 
-Phase 1: scan (known CVE pipeline only), report, status.
+Phase 1: known CVE pipeline (NVD/OSV/GHSA). Phase 2 adds the pre-CVE commit
+scanner + Groq/Claude/Ollama triage — both run as part of `scan`.
 """
 
 from __future__ import annotations
@@ -15,8 +16,10 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
+from llm.router import missing_api_key, resolve_provider_model
 from output.reporter import generate_report, write_report
 from pipelines.known_cve import load_watchlist, run_known_cve_pipeline
+from pipelines.pre_cve import run_pre_cve_pipeline
 from state.db import DEFAULT_DB_PATH, get_db, log_scan, status_summary
 
 load_dotenv()
@@ -47,8 +50,11 @@ def cli() -> None:
     help="Scan one layer only",
 )
 @click.option("--dry-run", is_flag=True, help="Run the pipeline but do not write findings to the database")
-def scan(package_names: tuple[str, ...], layer: str | None, dry_run: bool) -> None:
-    """Run the known CVE pipeline (NVD + OSV.dev + GHSA) for watchlist packages."""
+@click.option("--llm-provider", "llm_provider", default=None, help="Override the triage LLM provider for this run (groq|claude|ollama)")
+@click.option("--llm-model", "llm_model", default=None, help="Override the triage LLM model for this run")
+def scan(package_names: tuple[str, ...], layer: str | None, dry_run: bool, llm_provider: str | None, llm_model: str | None) -> None:
+    """Run the known CVE pipeline (NVD + OSV.dev + GHSA), then the pre-CVE
+    commit scanner + LLM triage, for watchlist packages."""
     watchlist = load_watchlist()
     targets = _filter_packages(watchlist, package_names, layer)
     if not targets:
@@ -58,7 +64,10 @@ def scan(package_names: tuple[str, ...], layer: str | None, dry_run: bool) -> No
     github_token = os.environ.get("GITHUB_TOKEN")
     nvd_api_key = os.environ.get("NVD_API_KEY")
     if not github_token:
-        console.print("[yellow]warning:[/yellow] GITHUB_TOKEN not set — GHSA source will be skipped for this run.")
+        console.print(
+            "[yellow]warning:[/yellow] GITHUB_TOKEN not set — GHSA source and the pre-CVE "
+            "commit scan will both be skipped for this run."
+        )
     if not nvd_api_key:
         console.print(
             "[yellow]warning:[/yellow] NVD_API_KEY not set — NVD queries run at the unauthenticated rate limit (slower)."
@@ -67,7 +76,7 @@ def scan(package_names: tuple[str, ...], layer: str | None, dry_run: bool) -> No
     db = get_db()
     console.print(f"Scanning {len(targets)} package(s) against NVD, OSV.dev, and GHSA...")
     start = time.monotonic()
-    result = asyncio.run(
+    known_result = asyncio.run(
         run_known_cve_pipeline(
             targets,
             db=db,
@@ -76,20 +85,48 @@ def scan(package_names: tuple[str, ...], layer: str | None, dry_run: bool) -> No
             dry_run=dry_run,
         )
     )
+
+    pre_cve_result = None
+    try:
+        resolved_provider, _ = resolve_provider_model("triage", provider=llm_provider, model=llm_model)
+    except ValueError as exc:
+        console.print(f"[yellow]warning:[/yellow] {exc} — skipping pre-CVE commit scan.")
+    else:
+        missing_env = missing_api_key(resolved_provider)
+        if missing_env:
+            console.print(
+                f"[yellow]warning:[/yellow] {missing_env} not set for triage provider {resolved_provider!r} "
+                "— skipping pre-CVE commit scan."
+            )
+        elif github_token:
+            console.print(f"Scanning commit history for pre-CVE signals (triage provider: {resolved_provider})...")
+            pre_cve_result = asyncio.run(
+                run_pre_cve_pipeline(
+                    targets,
+                    db=db,
+                    github_token=github_token,
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    dry_run=dry_run,
+                )
+            )
     duration = time.monotonic() - start
 
+    findings_new = known_result.findings_new + (pre_cve_result.findings_new if pre_cve_result else 0)
+    llm_calls = pre_cve_result.llm_calls if pre_cve_result else 0
     log_scan(
         db,
         mode="scan",
-        packages_scanned=result.packages_scanned,
-        findings_new=result.findings_new,
+        packages_scanned=known_result.packages_scanned,
+        findings_new=findings_new,
+        llm_calls_by_provider={resolved_provider: llm_calls} if pre_cve_result else {},
         duration_seconds=duration,
     )
 
     suffix = " (dry run — not written to database)" if dry_run else ""
     console.print(
-        f"[green]Done.[/green] {result.packages_scanned} package(s) scanned, "
-        f"{result.findings_new} new finding(s){suffix} in {duration:.1f}s."
+        f"[green]Done.[/green] {known_result.packages_scanned} package(s) scanned, "
+        f"{findings_new} new finding(s){suffix} in {duration:.1f}s."
     )
 
 
