@@ -19,7 +19,7 @@ from rich.table import Table
 from llm.router import missing_api_key, resolve_provider_model
 from output.reporter import generate_report, write_report
 from pipelines.known_cve import load_watchlist, run_known_cve_pipeline
-from pipelines.pre_cve import run_pre_cve_pipeline
+from pipelines.pre_cve import run_pre_cve_pipeline, run_watch_queue
 from state.db import DEFAULT_DB_PATH, get_db, log_scan, status_summary
 
 load_dotenv()
@@ -169,6 +169,38 @@ def _run_scan(targets: list[dict], *, dry_run: bool, llm_provider: str | None, l
     console.print(
         f"[green]Done.[/green] {known_result.packages_scanned} package(s) scanned, "
         f"{findings_new} new finding(s){suffix} in {duration:.1f}s."
+    )
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Run the re-check but do not write changes to the database")
+@click.option("--llm-provider", "llm_provider", default=None, help="Override the triage LLM provider for this run (groq|claude|ollama)")
+@click.option("--llm-model", "llm_model", default=None, help="Override the triage LLM model for this run")
+def watch(dry_run: bool, llm_provider: str | None, llm_model: str | None) -> None:
+    """Process the Lane 2 watch queue — re-triage findings whose 48h re-check is due."""
+    db = get_db()
+    watchlist = load_watchlist()
+    github_token = os.environ.get("GITHUB_TOKEN")
+    console.print("Processing watch queue (Lane 2 items due for re-check)...")
+    start = time.monotonic()
+    result = asyncio.run(
+        run_watch_queue(
+            watchlist, db=db, github_token=github_token, llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run
+        )
+    )
+    duration = time.monotonic() - start
+    log_scan(
+        db,
+        mode="watch",
+        packages_scanned=0,
+        findings_new=0,
+        llm_calls_by_provider={llm_provider or "default": result.llm_calls} if result.llm_calls else {},
+        duration_seconds=duration,
+    )
+    suffix = " (dry run — not written to database)" if dry_run else ""
+    console.print(
+        f"[green]Done.[/green] {result.items_checked} item(s) checked, {result.promoted} promoted out of Lane 2, "
+        f"{result.still_watching} still watching{suffix} in {duration:.1f}s."
     )
 
 

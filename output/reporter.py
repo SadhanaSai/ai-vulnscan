@@ -1,11 +1,11 @@
 """Markdown report generator — cve-agent-spec.md §11.
 
-CONFIRMED CVEs (known-CVE findings) and READY TO FILE (Lane 1, via
-triage/classifier.py) are populated as of Phase 2. WATCH QUEUE / PATTERN
-LIBRARY DELTA / DISCLOSURE TRACKER still render as explicit placeholders
-until the phases that populate them (watch queue re-check scheduling,
-pattern extraction, CVE drafter) exist — an empty table would look like "we
-scanned and found nothing" instead of "this feature isn't built yet."
+CONFIRMED CVEs, READY TO FILE (Lane 1), and WATCH QUEUE (Lane 2, via the
+watch_queue table populated in Phase 3) are populated as of Phase 3.
+PATTERN LIBRARY DELTA / DISCLOSURE TRACKER still render as explicit
+placeholders until the phases that populate them (pattern extraction, CVE
+drafter) exist — an empty table would look like "we scanned and found
+nothing" instead of "this feature isn't built yet."
 """
 
 from __future__ import annotations
@@ -98,16 +98,20 @@ def _ready_to_file_section(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
-def _watch_queue_section(findings: list[Finding]) -> str:
+def _watch_queue_section(db: sqlite_utils.Database, findings: list[Finding]) -> str:
+    watch_by_id = {r["finding_id"]: r for r in db["watch_queue"].rows} if "watch_queue" in db.table_names() else {}
     return _table_section(
         "WATCH QUEUE (Lane 2 — revisit in 48h)",
         findings,
-        empty_message=(
-            "No watch queue yet — Lane 2 re-check scheduling isn't built until "
-            "Phase 3 (`state/db.py` watch queue ops). This section will populate once that phase lands."
-        ),
+        empty_message="No Lane 2 findings currently in the watch queue.",
         columns=["ID", "Package", "Signal", "First Seen", "Next Check"],
-        row_fn=lambda f: [f.id[:12], f.package, f.signal_url, f.first_seen, "—"],
+        row_fn=lambda f: [
+            f.id[:12],
+            f.package,
+            f.signal_url,
+            f.first_seen,
+            (watch_by_id.get(f.id) or {}).get("next_check", "— (not yet scheduled)"),
+        ],
     )
 
 
@@ -160,7 +164,7 @@ def generate_report(db: sqlite_utils.Database, *, mode: str, packages_scanned: i
         "",
         "---",
         "",
-        _watch_queue_section(lane2_findings),
+        _watch_queue_section(db, lane2_findings),
         "",
         "---",
         "",

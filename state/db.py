@@ -11,7 +11,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +220,40 @@ def log_scan(
             "duration_seconds": duration_seconds,
         }
     )
+
+
+WATCH_RECHECK_HOURS = 48  # cve-agent-spec.md §8.3 / CLAUDE.md lane table: Lane 2 revisits in 48h
+
+
+def schedule_watch_check(db: sqlite_utils.Database, finding_id: str, *, hours: int = WATCH_RECHECK_HOURS) -> None:
+    """Add (or refresh) a Lane 2 finding's watch_queue entry, due `hours` from now."""
+    existing = list(db["watch_queue"].rows_where("finding_id = ?", [finding_id]))
+    check_count = existing[0]["check_count"] if existing else 0
+    next_check = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    db["watch_queue"].upsert(
+        {"finding_id": finding_id, "next_check": next_check, "check_count": check_count}, pk="finding_id"
+    )
+
+
+def bump_watch_check(db: sqlite_utils.Database, finding_id: str, *, hours: int = WATCH_RECHECK_HOURS) -> None:
+    """Still Lane 2 after a re-check: push next_check forward and increment check_count."""
+    existing = list(db["watch_queue"].rows_where("finding_id = ?", [finding_id]))
+    check_count = (existing[0]["check_count"] if existing else 0) + 1
+    next_check = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    db["watch_queue"].upsert(
+        {"finding_id": finding_id, "next_check": next_check, "check_count": check_count}, pk="finding_id"
+    )
+
+
+def due_watch_items(db: sqlite_utils.Database, *, now: str | None = None) -> list[dict[str, Any]]:
+    """watch_queue rows whose next_check has passed — backs `python main.py watch`."""
+    now = now or now_iso()
+    return list(db["watch_queue"].rows_where("next_check <= ?", [now]))
+
+
+def remove_from_watch_queue(db: sqlite_utils.Database, finding_id: str) -> None:
+    if db["watch_queue"].count_where("finding_id = ?", [finding_id]) > 0:
+        db["watch_queue"].delete(finding_id)
 
 
 def status_summary(db: sqlite_utils.Database) -> dict[str, Any]:

@@ -107,6 +107,10 @@ async def query_osv(client: httpx.AsyncClient, package: str, ecosystem: str) -> 
                 # commit-SHA matching — not used by the known-CVE pipeline itself
                 "affected": v.get("affected", []),
                 "references": [r["url"] for r in v.get("references", []) if r.get("url")],
+                # kept for pre_cve.py's dependency cross-reference (§8.2), which
+                # needs to pick the most-recent record out of a package's full
+                # vulnerability history — not used by the known-CVE pipeline itself
+                "modified": v.get("modified"),
             }
         )
     return results
