@@ -96,7 +96,9 @@ packages:
   - name: langflow
     ecosystem: pypi
     layer: framework
-    repo: logspace-ai/langflow
+    # logspace-ai org renamed to langflow-ai; old path 422s on commit search
+    # since GitHub's search API doesn't follow repo-rename redirects.
+    repo: langflow-ai/langflow
     agentic_context: null
     enabled: true
 
@@ -116,7 +118,10 @@ packages:
   - name: google-generativeai
     ecosystem: pypi
     layer: sdk
-    repo: google-gemini/generative-ai-python
+    # Upstream repo was renamed/archived by Google; still actively released
+    # on PyPI (0.8.6, 2025-12-16), so kept in the watchlist. GitHub's search
+    # API 422s on the old path since it doesn't follow repo-rename redirects.
+    repo: google-gemini/deprecated-generative-ai-python
     agentic_context: null
     enabled: true
   - name: mistralai
@@ -196,7 +201,10 @@ packages:
   - name: mcp-remote
     ecosystem: npm
     layer: mcp
-    repo: modelcontextprotocol/mcp-remote
+    # Third-party bridge tool, not part of the official MCP servers monorepo
+    # despite the name — npm's own registry metadata for this package points
+    # here (repository field), confirmed 2026-08-05.
+    repo: geelen/mcp-remote
     agentic_context: null
     enabled: true
 
@@ -228,7 +236,11 @@ packages:
   - name: e2b
     ecosystem: pypi
     layer: infrastructure
-    repo: e2b-dev/e2b-python
+    # e2b-dev/e2b-python doesn't exist (404) — PyPI's own project_urls says
+    # the Python SDK lives inside the e2b-dev/e2b monorepo at
+    # packages/python-sdk. GitHub search doesn't support subdirectory
+    # scoping, so we point at the monorepo root.
+    repo: e2b-dev/e2b
     agentic_context: "Sandboxed code execution for code agents"
     enabled: true
   - name: docker
@@ -254,4 +266,40 @@ packages:
     layer: infrastructure
     repo: celery/celery
     agentic_context: "Task queue used for agent orchestration"
+    enabled: true
+  - name: lancedb
+    ecosystem: pypi
+    layer: infrastructure
+    repo: lancedb/lancedb
+    agentic_context: "Serverless vector database (columnar Lance format) for multimodal retrieval"
+    enabled: true
+  - name: bentoml
+    ecosystem: pypi
+    layer: infrastructure
+    repo: bentoml/BentoML
+    agentic_context: "Model-serving framework packaging ML models into production microservices"
+    enabled: true
+  - name: transformers
+    ecosystem: pypi
+    layer: framework
+    repo: huggingface/transformers
+    agentic_context: "Core model loading/inference pipeline underlying many agent stacks — recurring unsafe deserialization RCE pattern across model-checkpoint loading"
+    enabled: true
+  - name: vllm
+    ecosystem: pypi
+    layer: infrastructure
+    repo: vllm-project/vllm
+    agentic_context: "High-throughput LLM inference/serving engine"
+    enabled: true
+  - name: open-webui
+    ecosystem: pypi
+    layer: framework
+    repo: open-webui/open-webui
+    agentic_context: "Self-hosted local AI chat frontend"
+    enabled: true
+  - name: ollama
+    ecosystem: npm
+    layer: sdk
+    repo: ollama/ollama-js
+    agentic_context: "JS client for local Ollama models — Windows build has had an unsigned-update RCE"
     enabled: true

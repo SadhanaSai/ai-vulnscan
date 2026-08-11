@@ -60,7 +60,49 @@ def scan(package_names: tuple[str, ...], layer: str | None, dry_run: bool, llm_p
     if not targets:
         console.print("[yellow]No packages matched the given filters.[/yellow]")
         return
+    _run_scan(targets, dry_run=dry_run, llm_provider=llm_provider, llm_model=llm_model)
 
+
+@cli.command(name="scan-repo")
+@click.option("--name", required=True, help="Package name — used for finding IDs, not persisted anywhere")
+@click.option("--ecosystem", type=click.Choice(["pypi", "npm"]), required=True)
+@click.option(
+    "--layer",
+    type=click.Choice(["framework", "sdk", "mcp", "infrastructure"]),
+    required=True,
+)
+@click.option("--repo", required=True, help="GitHub org/repo, e.g. org/repo")
+@click.option("--agentic-context", default=None, help="Optional free-text context for the LLM")
+@click.option("--dry-run", is_flag=True, help="Run the pipeline but do not write findings to the database")
+@click.option("--llm-provider", "llm_provider", default=None, help="Override the triage LLM provider for this run (groq|claude|ollama)")
+@click.option("--llm-model", "llm_model", default=None, help="Override the triage LLM model for this run")
+def scan_repo(
+    name: str,
+    ecosystem: str,
+    layer: str,
+    repo: str,
+    agentic_context: str | None,
+    dry_run: bool,
+    llm_provider: str | None,
+    llm_model: str | None,
+) -> None:
+    """One-off scan of a single package/repo. Does not read or write
+    config/watchlist.yaml — the package is not persisted anywhere; this run
+    is the only place it's scanned. Findings still land in the same
+    database as watchlist scans, so re-running `scan-repo` on the same repo
+    later won't re-report anything already seen."""
+    target = {
+        "name": name,
+        "ecosystem": ecosystem,
+        "layer": layer,
+        "repo": repo,
+        "agentic_context": agentic_context,
+        "enabled": True,
+    }
+    _run_scan([target], dry_run=dry_run, llm_provider=llm_provider, llm_model=llm_model)
+
+
+def _run_scan(targets: list[dict], *, dry_run: bool, llm_provider: str | None, llm_model: str | None) -> None:
     github_token = os.environ.get("GITHUB_TOKEN")
     nvd_api_key = os.environ.get("NVD_API_KEY")
     if not github_token:
