@@ -94,6 +94,18 @@ CREATE TABLE IF NOT EXISTS scan_log (
     llm_calls_by_provider TEXT,  -- JSON object, e.g. {"groq": 12, "claude": 3, "ollama": 0}
     duration_seconds REAL
 );
+
+CREATE TABLE IF NOT EXISTS dynamic_validation_runs (  -- Phase 7, §8.7 — append-only audit log
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    depth TEXT NOT NULL,        -- "pattern_confirmation" | "class_exploit"
+    vulnerability_class TEXT,   -- set only for depth="class_exploit"
+    result TEXT NOT NULL,       -- "confirmed" | "not_confirmed" | "inconclusive" | "error"
+    summary TEXT,
+    log TEXT,                   -- full command + output audit trail, nothing redacted
+    FOREIGN KEY (finding_id) REFERENCES findings(id)
+);
 """
 
 # Finding fields that are stored as JSON text and need encode/decode at the boundary.
@@ -189,6 +201,31 @@ class Pattern:
         for f in _PATTERN_JSON_FIELDS:
             row[f] = json.loads(row[f]) if row.get(f) else []
         return cls(**row)
+
+
+@dataclass
+class DynamicValidationRun:
+    """Phase 7 (§8.7) — one on-demand `python main.py validate` invocation.
+    Append-only: a finding accumulates many of these over time, unlike the
+    single mutable Finding row. Never touches Finding.lane/status."""
+
+    finding_id: str
+    depth: str  # "pattern_confirmation" | "class_exploit"
+    result: str  # "confirmed" | "not_confirmed" | "inconclusive" | "error"
+    vulnerability_class: str | None = None
+    summary: str | None = None
+    log: str | None = None
+    requested_at: str = field(default_factory=now_iso)
+    id: int | None = None
+
+    def to_row(self) -> dict[str, Any]:
+        row = asdict(self)
+        row.pop("id")  # autoincrement — never set explicitly on insert
+        return row
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "DynamicValidationRun":
+        return cls(**dict(row))
 
 
 def get_db(path: str | Path = DEFAULT_DB_PATH) -> sqlite_utils.Database:
@@ -388,3 +425,37 @@ def list_disclosures(db: sqlite_utils.Database) -> list[dict[str, Any]]:
     if "disclosure_log" not in db.table_names():
         return []
     return list(db["disclosure_log"].rows)
+
+
+# --- dynamic validation runs (cve-agent-spec.md §8.7, Phase 7 — on-demand only) ---
+
+
+def record_validation_run(db: sqlite_utils.Database, run: DynamicValidationRun) -> DynamicValidationRun:
+    """Append-only insert — never upsert. Every `validate` invocation gets
+    its own row, regardless of result (including "error")."""
+    row_id = db["dynamic_validation_runs"].insert(run.to_row()).last_pk
+    run.id = row_id
+    return run
+
+
+def list_validation_runs(db: sqlite_utils.Database, finding_id: str) -> list[DynamicValidationRun]:
+    if "dynamic_validation_runs" not in db.table_names():
+        return []
+    rows = db["dynamic_validation_runs"].rows_where("finding_id = ?", [finding_id], order_by="requested_at")
+    return [DynamicValidationRun.from_row(r) for r in rows]
+
+
+def latest_validation_run(db: sqlite_utils.Database, finding_id: str) -> DynamicValidationRun | None:
+    runs = list_validation_runs(db, finding_id)
+    return runs[-1] if runs else None
+
+
+def all_latest_validation_runs(db: sqlite_utils.Database) -> dict[str, DynamicValidationRun]:
+    """One most-recent run per finding_id — backs the report's dynamic
+    validation section without an N+1 query per finding."""
+    if "dynamic_validation_runs" not in db.table_names():
+        return {}
+    latest: dict[str, DynamicValidationRun] = {}
+    for row in db["dynamic_validation_runs"].rows_where(order_by="requested_at"):
+        latest[row["finding_id"]] = DynamicValidationRun.from_row(row)
+    return latest

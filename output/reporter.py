@@ -1,10 +1,11 @@
 """Markdown report generator — cve-agent-spec.md §11.
 
-All six sections are populated as of Phase 6: CONFIRMED CVEs, READY TO FILE
-(Lane 1 findings with status="ready_to_file" — set only by
-output/cve_drafter.py's pre-file cross-check gate, §8.6), WATCH QUEUE
-(Lane 2, Phase 3), PATTERN LIBRARY DELTA (Phase 4/5), and DISCLOSURE TRACKER
-(Phase 6, `python main.py disclose`).
+Sections: CONFIRMED CVEs, READY TO FILE (Lane 1 findings with
+status="ready_to_file" — set only by output/cve_drafter.py's pre-file
+cross-check gate, §8.6), WATCH QUEUE (Lane 2, Phase 3), PATTERN LIBRARY
+DELTA (Phase 4/5), DYNAMIC VALIDATION (Phase 7, §8.7 — informational only,
+never touches lane/status), and DISCLOSURE TRACKER (Phase 6,
+`python main.py disclose`).
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Any, Callable, Iterable
 
 import sqlite_utils
 
-from state.db import PROJECT_ROOT, Finding, list_findings, list_patterns
+from state.db import PROJECT_ROOT, Finding, all_latest_validation_runs, list_findings, list_patterns
 
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports"
 
@@ -136,6 +137,33 @@ def _pattern_library_section(db: sqlite_utils.Database) -> str:
     )
 
 
+def _dynamic_validation_section(db: sqlite_utils.Database, findings_by_id: dict[str, Finding]) -> str:
+    # Phase 7 (§8.7) — strictly on-demand, informational only: this section
+    # never influences lane/status, it just surfaces the most recent
+    # `python main.py validate` result per finding, if any have been run.
+    latest_by_finding = all_latest_validation_runs(db)
+    rows = sorted(latest_by_finding.values(), key=lambda r: r.requested_at, reverse=True)
+
+    def _row(r: Any) -> list[Any]:
+        f = findings_by_id.get(r.finding_id)
+        return [
+            r.finding_id[:12],
+            f.package if f else "—",
+            "class_exploit (" + (r.vulnerability_class or "?") + ")" if r.depth == "class_exploit" else "pattern_confirmation",
+            r.result,
+            _md_escape(r.summary) or "—",
+            r.requested_at,
+        ]
+
+    return _table_section(
+        "DYNAMIC VALIDATION (Phase 7 — on-demand only, informational)",
+        rows,
+        empty_message="No dynamic validation runs yet — `python main.py validate --finding-id ID` is strictly on-demand.",
+        columns=["Finding ID", "Package", "Depth", "Result", "Summary", "Requested At"],
+        row_fn=_row,
+    )
+
+
 def _disclosure_tracker_section(db: sqlite_utils.Database, findings_by_id: dict[str, Finding]) -> str:
     entries = list(db["disclosure_log"].rows) if "disclosure_log" in db.table_names() else []
 
@@ -188,6 +216,10 @@ def generate_report(db: sqlite_utils.Database, *, mode: str, packages_scanned: i
         "---",
         "",
         _pattern_library_section(db),
+        "",
+        "---",
+        "",
+        _dynamic_validation_section(db, findings_by_id),
         "",
         "---",
         "",

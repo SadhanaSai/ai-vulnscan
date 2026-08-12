@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import time
 
 import click
@@ -23,7 +24,23 @@ from output.reporter import generate_report, write_report
 from patterns.extractor import run_pattern_extraction
 from pipelines.known_cve import load_watchlist, run_known_cve_pipeline
 from pipelines.pre_cve import run_pre_cve_pipeline, run_watch_queue
-from state.db import DEFAULT_DB_PATH, get_db, get_finding, list_patterns, log_scan, record_disclosure, status_summary
+from state.db import (
+    DEFAULT_DB_PATH,
+    DynamicValidationRun,
+    get_db,
+    get_finding,
+    list_patterns,
+    log_scan,
+    record_disclosure,
+    record_validation_run,
+    status_summary,
+)
+from validation._shared import ValidationOutcome
+from validation.classify import HARNESS_CLASSES, class_matches_finding
+from validation.harnesses import get_harness_runner
+from validation.harnesses._shared import MissingTargetParams
+from validation.pattern_confirmation import confirm_pattern
+from validation.version_resolution import resolve_version
 
 load_dotenv()
 console = Console()
@@ -345,6 +362,110 @@ def report(output_path: str | None, llm_provider: str | None, llm_model: str | N
     )
     path = write_report(content, output_path)
     console.print(f"[green]Report written to[/green] {path}")
+
+
+@cli.command()
+@click.option("--finding-id", "finding_id", required=True)
+@click.option(
+    "--class",
+    "class_name",
+    type=click.Choice(sorted(HARNESS_CLASSES)),
+    default=None,
+    help="Run one of the six fixed exploit harnesses instead of the default pattern-confirmation depth.",
+)
+@click.option("--target-module", default=None, help="--class only: dotted module path to import inside the sandbox")
+@click.option("--target-callable", default=None, help="--class only: dot-separated attribute path to the vulnerable callable")
+@click.option("--target-param", default=None, help="--class only: keyword arg the injected value goes in (omit for a positional call)")
+@click.option(
+    "--target-mode",
+    type=click.Choice(["read", "write"]),
+    default=None,
+    help="--class arbitrary_file_rw only: which primitive to probe (default: write)",
+)
+@click.option("--version", "version_override", default=None, help="Exact affected version to install (default: auto-resolved)")
+@click.option(
+    "--force", is_flag=True, help="Required to run --class against a finding whose recorded CWE doesn't match that class"
+)
+def validate(
+    finding_id: str,
+    class_name: str | None,
+    target_module: str | None,
+    target_callable: str | None,
+    target_param: str | None,
+    target_mode: str | None,
+    version_override: str | None,
+    force: bool,
+) -> None:
+    """Phase 7 (cve-agent-spec.md §8.7) dynamic validation — strictly
+    on-demand, one finding at a time, never part of scan/watch/hunt/report.
+    Installs the affected version inside a hardened, single-use Docker
+    sandbox (validation/sandbox.py), then either confirms the flagged code
+    shape is present in the installed artifact (default depth) or runs one
+    of six fixed, non-destructive exploit harnesses (--class). Every run —
+    whatever the result — is appended to dynamic_validation_runs; this
+    command never touches a finding's lane/status/ready_to_file. The
+    researcher decides what a result means for their filing decision."""
+    db = get_db()
+    finding = get_finding(db, finding_id)
+    if finding is None:
+        console.print(f"[red]error:[/red] no finding with id {finding_id!r}")
+        raise SystemExit(1)
+
+    if shutil.which("docker") is None:
+        console.print("[red]error:[/red] docker not found on PATH — Phase 7 requires a local Docker daemon.")
+        raise SystemExit(1)
+
+    depth = "class_exploit" if class_name else "pattern_confirmation"
+
+    if class_name and not force and not class_matches_finding(class_name, finding):
+        console.print(
+            f"[red]error:[/red] --class {class_name} does not match this finding's recorded CWE(s) "
+            f"({', '.join(finding.cwe) or 'none'}). Pass --force to run it anyway."
+        )
+        raise SystemExit(1)
+
+    version, version_source = asyncio.run(resolve_version(finding, override_version=version_override))
+    if version is None:
+        outcome = ValidationOutcome(result="inconclusive", summary=version_source, log="")
+    else:
+        console.print(f"Installing {finding.package}=={version} ({version_source})...")
+        if class_name is None:
+            outcome = asyncio.run(
+                confirm_pattern(finding, package=finding.package, ecosystem=finding.ecosystem, version=version)
+            )
+        else:
+            try:
+                runner = get_harness_runner(class_name)
+                extra = {"target_mode": target_mode} if class_name == "arbitrary_file_rw" else {}
+                outcome = asyncio.run(
+                    runner(
+                        finding,
+                        package=finding.package,
+                        ecosystem=finding.ecosystem,
+                        version=version,
+                        target_module=target_module,
+                        target_callable=target_callable,
+                        target_param=target_param,
+                        **extra,
+                    )
+                )
+            except MissingTargetParams as exc:
+                outcome = ValidationOutcome(result="inconclusive", summary=str(exc), log="")
+
+    run = DynamicValidationRun(
+        finding_id=finding.id,
+        depth=depth,
+        vulnerability_class=class_name,
+        result=outcome.result,
+        summary=outcome.summary,
+        log=outcome.log,
+    )
+    record_validation_run(db, run)
+
+    color = {"confirmed": "red", "not_confirmed": "green", "inconclusive": "yellow", "error": "yellow"}.get(
+        outcome.result, "white"
+    )
+    console.print(f"[{color}]{outcome.result}[/{color}]: {outcome.summary}")
 
 
 @cli.command()
