@@ -174,9 +174,11 @@ def _run_scan(targets: list[dict], *, dry_run: bool, llm_provider: str | None, l
                 "— skipping pattern extraction."
             )
         elif github_token:
+            package_to_repo = {p["name"]: p["repo"] for p in load_watchlist() if p.get("repo")}
             new_patterns = asyncio.run(
                 run_pattern_extraction(
-                    db=db, github_token=github_token, llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run
+                    db=db, github_token=github_token, package_to_repo=package_to_repo,
+                    llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
                 )
             )
             if new_patterns:
