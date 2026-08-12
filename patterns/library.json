@@ -1,0 +1,23 @@
+[
+  {
+    "agentic_context": "Software development, dependency management",
+    "atlas_technique": "AML.T1530",
+    "confirmed_hits": [
+      "b7271d87ca5f59aa21d9902503e82aa1afbcca7ef12ca7df0c011117892b3eb4"
+    ],
+    "created_at": "2026-08-12T01:10:53.322579+00:00",
+    "cwe": [
+      "CWE-502"
+    ],
+    "false_positives": 0,
+    "id": "SDK-DESERIALIZATION-OF-UNTRUSTED-DATA-001",
+    "last_updated": "2026-08-12T01:10:53.322596+00:00",
+    "layer": "sdk",
+    "safe_shape": "Dependency on a library with patched or up-to-date versions",
+    "source_commit_url": "https://github.com/ray-project/ray/commit/26bedee6aa9fa0658f6833dadba1ec75eab8518b",
+    "source_finding_id": "b7271d87ca5f59aa21d9902503e82aa1afbcca7ef12ca7df0c011117892b3eb4",
+    "trigger": "Usage of outdated or vulnerable library versions",
+    "vulnerability_class": "Deserialization of Untrusted Data",
+    "vulnerable_shape": "Dependency on a library with known deserialization vulnerabilities"
+  }
+]

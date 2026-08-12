@@ -3,6 +3,11 @@
 # layer: "framework" | "sdk" | "mcp" | "infrastructure"
 # ecosystem: "pypi" | "npm"
 # repo: GitHub "org/repo" used for commit/issue/PR/GHSA lookups
+# path_prefix: optional — set this when `repo` is a monorepo hosting other
+#   unrelated packages (e.g. Azure SDK's shared repo, the archived MCP
+#   servers repo). Scopes commit/PR/pattern-hunt signals to files under this
+#   path so an unrelated sibling package's activity doesn't get misattributed
+#   here. Omit for single-package repos — no filtering is applied.
 # agentic_context: optional free-text used by the LLM to write sharper
 #   CVE descriptions and agentic-uplift analysis (Phases 2+)
 # enabled: false packages are skipped by all pipelines but stay listed here
@@ -145,7 +150,11 @@ packages:
   - name: azure-ai-inference
     ecosystem: pypi
     layer: sdk
+    # Monorepo hosting dozens of unrelated Azure SDKs — path_prefix scopes
+    # signals to this package specifically. Discovered 2026-08-12 after a
+    # Lane 1A finding turned out to be a misattributed azure-storage-blob PR.
     repo: Azure/azure-sdk-for-python
+    path_prefix: sdk/ai/azure-ai-inference/
     agentic_context: null
     enabled: true
 
@@ -180,24 +189,40 @@ packages:
     repo: modelcontextprotocol/servers
     agentic_context: null
     enabled: true
-  - name: mcp-server-github
+  - name: "@modelcontextprotocol/server-github"
     ecosystem: npm
     layer: mcp
-    repo: modelcontextprotocol/servers
+    # Was "mcp-server-github" pointing at an unrelated unscoped npm package
+    # (a disclosed npm name-confusion research canary, theinfosecguy/npx-canary
+    # — not the real MCP server) and modelcontextprotocol/servers, which no
+    # longer hosts this server. Corrected 2026-08-12. Real package is
+    # deprecated upstream ("no longer supported") — disabled, not removed,
+    # since existing installs may still be worth tracking for known CVEs.
+    repo: modelcontextprotocol/servers-archived
+    path_prefix: src/github/
     agentic_context: null
-    enabled: true
-  - name: mcp-server-slack
+    enabled: false
+  - name: "@modelcontextprotocol/server-slack"
     ecosystem: npm
     layer: mcp
-    repo: modelcontextprotocol/servers
+    # Was "mcp-server-slack" pointing at an unrelated third-party npm package
+    # (not the real MCP server, not the canary either — just a different
+    # unaffiliated maintainer's package that happened to share the name).
+    # Corrected 2026-08-12. Real package is deprecated upstream — disabled.
+    repo: modelcontextprotocol/servers-archived
+    path_prefix: src/slack/
     agentic_context: null
-    enabled: true
-  - name: mcp-server-postgres
+    enabled: false
+  - name: "@modelcontextprotocol/server-postgres"
     ecosystem: npm
     layer: mcp
-    repo: modelcontextprotocol/servers
+    # Was "mcp-server-postgres" pointing at the same npx-canary research
+    # package as mcp-server-github (see above). Corrected 2026-08-12. Real
+    # package is deprecated upstream — disabled.
+    repo: modelcontextprotocol/servers-archived
+    path_prefix: src/postgres/
     agentic_context: null
-    enabled: true
+    enabled: false
   - name: mcp-remote
     ecosystem: npm
     layer: mcp

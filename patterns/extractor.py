@@ -284,7 +284,9 @@ async def _find_matching_tag(client: httpx.AsyncClient, repo: str, version: str,
 MAX_HEAD_SEARCH_COMMITS = 200  # bounds the "no known fixed tag, search to HEAD" case below
 
 
-async def _find_fix_commit_via_version_range(repo: str, affected_tag: str | None, fixed_tag: str) -> str | None:
+async def _find_fix_commit_via_version_range(
+    repo: str, affected_tag: str | None, fixed_tag: str, *, path_prefix: str | None = None
+) -> str | None:
     """Clone (full history — `git log` over a tag range needs it, unlike the
     pattern hunter's shallow clones), then narrow the commits between the
     affected and fixed tags to the first one matching a security keyword.
@@ -313,6 +315,11 @@ async def _find_fix_commit_via_version_range(repo: str, affected_tag: str | None
         log_args = ["git", "-C", str(tmp_dir), "log", range_spec, "--oneline", "--no-merges"]
         if searching_to_head:
             log_args.append("--reverse")
+        if path_prefix:
+            # Monorepo scoping (watchlist.yaml path_prefix) — without this, a
+            # commit anywhere in the repo's history can match, including in
+            # an entirely unrelated sibling package.
+            log_args += ["--", path_prefix]
         log_proc = await asyncio.create_subprocess_exec(
             *log_args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
@@ -338,6 +345,7 @@ async def extract_pattern_from_known_cve(
     finding: Finding,
     *,
     repo: str,
+    path_prefix: str | None = None,
     db: Any,
     github_token: str,
     llm_provider: str | None = None,
@@ -378,7 +386,7 @@ async def extract_pattern_from_known_cve(
         else:
             fixed_tag = "HEAD"  # OSV only gave last_affected — search forward, bounded (see _find_fix_commit_via_version_range)
 
-    commit_sha = await _find_fix_commit_via_version_range(repo, affected_tag, fixed_tag)
+    commit_sha = await _find_fix_commit_via_version_range(repo, affected_tag, fixed_tag, path_prefix=path_prefix)
     if commit_sha is None:
         return None
 
@@ -401,6 +409,7 @@ async def run_pattern_extraction(
     db: Any,
     github_token: str,
     package_to_repo: dict[str, str] | None = None,
+    package_to_path_prefix: dict[str, str] | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
     library_path: str | None = None,
@@ -412,7 +421,9 @@ async def run_pattern_extraction(
     known-CVE findings via the narrow-to-fix-commit path, highest CVSS
     first. `package_to_repo` is a watchlist name->repo lookup; known-CVE
     findings don't carry their own repo, so without it that path is skipped
-    entirely.
+    entirely. `package_to_path_prefix` (watchlist.yaml `path_prefix`, for
+    monorepo-hosted packages) is optional and only needed for entries where
+    it's actually set — omitted entries get no path scoping, same as before.
 
     Note: unlike other pipelines, dry_run here doesn't fully "re-run cleanly
     next time" — since nothing is persisted (no pattern_id written back),
@@ -441,10 +452,12 @@ async def run_pattern_extraction(
             (f for f in all_findings if f.lane == "known" and f.cve_id and not f.pattern_id and f.package in package_to_repo),
             key=lambda f: -(f.cvss or 0),
         )[:MAX_KNOWN_CVE_EXTRACTIONS_PER_RUN]
+        path_prefixes = package_to_path_prefix or {}
         for finding in known_candidates:
             try:
                 pattern = await extract_pattern_from_known_cve(
-                    finding, repo=package_to_repo[finding.package], db=db, github_token=github_token,
+                    finding, repo=package_to_repo[finding.package], path_prefix=path_prefixes.get(finding.package),
+                    db=db, github_token=github_token,
                     llm_provider=llm_provider, llm_model=llm_model, library_path=library_path, dry_run=dry_run,
                 )
             except Exception as exc:

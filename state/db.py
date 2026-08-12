@@ -214,6 +214,12 @@ def get_finding(db: sqlite_utils.Database, finding_id: str) -> Finding | None:
     return Finding.from_row(rows[0]) if rows else None
 
 
+def delete_finding(db: sqlite_utils.Database, finding_id: str) -> None:
+    """Remove a finding and any watch-queue entry for it (e.g. purging confirmed bad data)."""
+    db["findings"].delete_where("id = ?", [finding_id])
+    remove_from_watch_queue(db, finding_id)
+
+
 def list_findings(
     db: sqlite_utils.Database,
     *,

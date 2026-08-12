@@ -177,6 +177,51 @@ def _issue_to_signal_content(item: dict[str, Any]) -> str:
     return f"{title}\n\n{body}".strip()[:2000]
 
 
+async def _commit_touches_path(
+    client: httpx.AsyncClient, repo: str, sha: str, path_prefix: str, *, token: str
+) -> bool:
+    """For monorepo-hosted packages (watchlist.yaml `path_prefix`) — commit
+    search results don't include changed files, so this fetches them
+    separately. Without this, a commit search scoped to `repo:{repo}` alone
+    can match an unrelated sibling package in the same monorepo (e.g. Azure
+    SDK's shared repo) and misattribute it here."""
+    resp = await request_with_retry(
+        client, "GET", f"https://api.github.com/repos/{repo}/commits/{sha}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    )
+    if resp is None:
+        return False
+    files = resp.json().get("files", [])
+    return any(f.get("filename", "").startswith(path_prefix) for f in files)
+
+
+async def _pr_touches_path(
+    client: httpx.AsyncClient, repo: str, number: int, path_prefix: str, *, token: str
+) -> bool:
+    """PR counterpart to _commit_touches_path() — same reasoning."""
+    resp = await request_with_retry(
+        client, "GET", f"https://api.github.com/repos/{repo}/pulls/{number}/files",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        params={"per_page": 100},
+    )
+    if resp is None:
+        return False
+    files = resp.json()
+    return any(f.get("filename", "").startswith(path_prefix) for f in files)
+
+
+def _issue_mentions_path_component(item: dict[str, Any], path_prefix: str) -> bool:
+    """Issues have no "changed files" to check — a lighter heuristic:
+    confirm the path_prefix's own directory name (usually the package name)
+    appears in the issue text. Weaker than the commit/PR check, but issues
+    carry no file-level ground truth to check against at all."""
+    component = path_prefix.rstrip("/").rsplit("/", 1)[-1].lower()
+    if not component:
+        return True
+    text = f"{item.get('title', '')} {item.get('body') or ''}".lower()
+    return component in text
+
+
 def _hn_mentions_security(hit: dict[str, Any], package_name: str) -> bool:
     """Algolia's search is relevance-ranked, not a strict boolean filter, so
     confirm the package name and a security term both actually appear before
@@ -432,6 +477,9 @@ async def run_pre_cve_pipeline(
         signal_url = item.get("html_url")
         if not sha or not signal_url:
             return
+        path_prefix = pkg.get("path_prefix")
+        if path_prefix and not await _commit_touches_path(client, pkg["repo"], sha, path_prefix, token=github_token):
+            return
         await handle_signal(
             client,
             pkg,
@@ -447,6 +495,9 @@ async def run_pre_cve_pipeline(
         signal_url = item.get("html_url")
         if not signal_url:
             return
+        path_prefix = pkg.get("path_prefix")
+        if path_prefix and not _issue_mentions_path_component(item, path_prefix):
+            return
         await handle_signal(
             client,
             pkg,
@@ -460,6 +511,10 @@ async def run_pre_cve_pipeline(
     async def process_pr(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> None:
         signal_url = item.get("html_url")
         if not signal_url:
+            return
+        path_prefix = pkg.get("path_prefix")
+        number = item.get("number")
+        if path_prefix and number and not await _pr_touches_path(client, pkg["repo"], number, path_prefix, token=github_token):
             return
         await handle_signal(
             client,

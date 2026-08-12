@@ -514,7 +514,7 @@ async def test_extract_known_cve_uses_head_when_only_last_affected_known(tmp_pat
 
     seen_tags = {}
 
-    async def fake_find_commit(repo, affected_tag, fixed_tag):
+    async def fake_find_commit(repo, affected_tag, fixed_tag, *, path_prefix=None):
         seen_tags["affected"] = affected_tag
         seen_tags["fixed"] = fixed_tag
         return "deadbeef456"
@@ -572,7 +572,7 @@ async def test_extract_known_cve_full_happy_path(tmp_path, monkeypatch):
     async def fake_find_tag(client, repo, version, *, token):
         return f"v{version}"
 
-    async def fake_find_commit(repo, affected_tag, fixed_tag):
+    async def fake_find_commit(repo, affected_tag, fixed_tag, *, path_prefix=None):
         assert affected_tag == "v1.0.0"
         assert fixed_tag == "v1.5.0"
         return "deadbeef123"
@@ -630,7 +630,7 @@ async def test_run_pattern_extraction_known_cve_requires_package_to_repo(tmp_pat
 async def test_run_pattern_extraction_known_cve_capped_and_sorted_by_severity(tmp_path, monkeypatch):
     processed = []
 
-    async def fake_extract_known(finding, *, repo, db, github_token, llm_provider=None, llm_model=None, library_path=None, dry_run=False):
+    async def fake_extract_known(finding, *, repo, db, github_token, path_prefix=None, llm_provider=None, llm_model=None, library_path=None, dry_run=False):
         processed.append((finding.id, finding.cvss))
         return None
 

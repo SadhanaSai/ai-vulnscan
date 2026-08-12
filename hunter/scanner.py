@@ -182,12 +182,22 @@ def _iter_source_files(root: Path, ecosystem: str) -> list[Path]:
     return files
 
 
-def _find_candidates(root: Path, ecosystem: str, keywords: list[str]) -> list[tuple[Path, str, str, int, int]]:
+def _find_candidates(
+    root: Path, ecosystem: str, keywords: list[str], *, path_prefix: str | None = None
+) -> list[tuple[Path, str, str, int, int]]:
     """Returns (filepath, function_name, function_source, start_line, end_line),
-    capped at MAX_CANDIDATES_PER_PACKAGE to bound LLM calls."""
+    capped at MAX_CANDIDATES_PER_PACKAGE to bound LLM calls.
+
+    `path_prefix` (watchlist.yaml, for monorepo-hosted packages) scopes the
+    walk to that subdirectory — without it, hunting a package like
+    azure-ai-inference would scan the entire azure-sdk-for-python monorepo
+    and could misattribute an unrelated sibling package's code here."""
     finder = _python_candidates if ecosystem == "pypi" else _js_candidates
+    scan_root = (root / path_prefix) if path_prefix else root
+    if not scan_root.is_dir():
+        return []
     results: list[tuple[Path, str, str, int, int]] = []
-    for path in _iter_source_files(root, ecosystem):
+    for path in _iter_source_files(scan_root, ecosystem):
         try:
             source = path.read_text(errors="ignore")
         except OSError:
@@ -329,7 +339,7 @@ async def hunt_pattern_in_package(
         if sha is None:
             return []
 
-        candidates = _find_candidates(tmp_dir, pkg["ecosystem"], keywords)
+        candidates = _find_candidates(tmp_dir, pkg["ecosystem"], keywords, path_prefix=pkg.get("path_prefix"))
         result.candidates_scanned += len(candidates)
 
         for filepath, func_name, func_source, start, end in candidates:

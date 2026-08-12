@@ -169,7 +169,7 @@ async def test_hunt_pattern_in_package_persists_high_confidence_match(tmp_path, 
         dest.mkdir(parents=True, exist_ok=True)
         return "deadbeef"
 
-    def fake_find_candidates(root, ecosystem, keywords):
+    def fake_find_candidates(root, ecosystem, keywords, path_prefix=None):
         return [(root / "server.py", "read_file", "def read_file(filename): ...", 10, 12)]
 
     async def fake_hunt_candidate(pattern, source, *, provider, model):
@@ -208,7 +208,7 @@ async def test_hunt_pattern_in_package_low_confidence_is_false_positive_not_find
         dest.mkdir(parents=True, exist_ok=True)
         return "deadbeef"
 
-    def fake_find_candidates(root, ecosystem, keywords):
+    def fake_find_candidates(root, ecosystem, keywords, path_prefix=None):
         return [(root / "server.py", "read_file", "def read_file(filename): ...", 10, 12)]
 
     async def fake_hunt_candidate(pattern, source, *, provider, model):
@@ -239,7 +239,7 @@ async def test_hunt_pattern_in_package_known_cve_match_routes_to_known_lane(tmp_
         dest.mkdir(parents=True, exist_ok=True)
         return "deadbeef"
 
-    def fake_find_candidates(root, ecosystem, keywords):
+    def fake_find_candidates(root, ecosystem, keywords, path_prefix=None):
         return [(root / "server.py", "read_file", "def read_file(filename): ...", 10, 12)]
 
     async def fake_hunt_candidate(pattern, source, *, provider, model):
