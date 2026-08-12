@@ -19,6 +19,7 @@ import sqlite_utils
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "state" / "cve_agent.db"
+DEFAULT_LIBRARY_PATH = PROJECT_ROOT / "patterns" / "library.json"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS findings (
@@ -151,6 +152,45 @@ class Finding:
         return cls(**row)
 
 
+# Pattern's `trigger` field maps to the `trigger_desc` DB column (SCHEMA
+# avoids the bare name `trigger` — reserved-adjacent in SQL) — CLAUDE.md's
+# canonical Pattern dataclass names it `trigger`, so the row<->object mapping
+# translates it at the boundary, same pattern as Finding's JSON fields.
+_PATTERN_JSON_FIELDS = ("cwe", "confirmed_hits")
+
+
+@dataclass
+class Pattern:
+    id: str
+    vulnerability_class: str
+    layer: str | None = None
+    trigger: str | None = None
+    vulnerable_shape: str | None = None
+    safe_shape: str | None = None
+    agentic_context: str | None = None
+    cwe: list[str] = field(default_factory=list)
+    atlas_technique: str | None = None
+    source_finding_id: str | None = None
+    source_commit_url: str | None = None
+    confirmed_hits: list[str] = field(default_factory=list)
+    false_positives: int = 0
+    created_at: str = field(default_factory=now_iso)
+    last_updated: str = field(default_factory=now_iso)
+
+    def to_row(self) -> dict[str, Any]:
+        row = asdict(self)
+        row["trigger_desc"] = row.pop("trigger")
+        return row
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "Pattern":
+        row = dict(row)
+        row["trigger"] = row.pop("trigger_desc", None)
+        for f in _PATTERN_JSON_FIELDS:
+            row[f] = json.loads(row[f]) if row.get(f) else []
+        return cls(**row)
+
+
 def get_db(path: str | Path = DEFAULT_DB_PATH) -> sqlite_utils.Database:
     """Open (creating if needed) the state DB and ensure the schema exists."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -265,3 +305,80 @@ def status_summary(db: sqlite_utils.Database) -> dict[str, Any]:
         "by_lane": by_lane,
         "by_status": by_status,
     }
+
+
+# --- patterns (cve-agent-spec.md §8.4/§8.5, Phase 4/5) -----------------------
+
+
+def upsert_pattern(db: sqlite_utils.Database, pattern: Pattern) -> None:
+    pattern.last_updated = now_iso()
+    db["patterns"].upsert(pattern.to_row(), pk="id")
+
+
+def get_pattern(db: sqlite_utils.Database, pattern_id: str) -> Pattern | None:
+    rows = list(db["patterns"].rows_where("id = ?", [pattern_id]))
+    return Pattern.from_row(rows[0]) if rows else None
+
+
+def list_patterns(db: sqlite_utils.Database) -> list[Pattern]:
+    if "patterns" not in db.table_names():
+        return []
+    return [Pattern.from_row(r) for r in db["patterns"].rows]
+
+
+def record_pattern_hit(db: sqlite_utils.Database, pattern_id: str, finding_id: str) -> None:
+    pattern = get_pattern(db, pattern_id)
+    if pattern is None:
+        return
+    if finding_id not in pattern.confirmed_hits:
+        pattern.confirmed_hits.append(finding_id)
+    upsert_pattern(db, pattern)
+
+
+def record_pattern_false_positive(db: sqlite_utils.Database, pattern_id: str) -> None:
+    pattern = get_pattern(db, pattern_id)
+    if pattern is None:
+        return
+    pattern.false_positives += 1
+    upsert_pattern(db, pattern)
+
+
+def export_pattern_library(db: sqlite_utils.Database, path: str | Path = DEFAULT_LIBRARY_PATH) -> None:
+    """Rewrite patterns/library.json (git-tracked, CLAUDE.md file structure)
+    from the current patterns table — the DB is the live/authoritative copy
+    (confirmed_hits and false_positives change as the hunter runs), the JSON
+    file is a full re-export snapshot kept in sync on every pattern change."""
+    patterns = [asdict(p) for p in list_patterns(db)]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(patterns, indent=2, sort_keys=True) + "\n")
+
+
+# --- disclosure log (cve-agent-spec.md §8.6/§12, Phase 6) --------------------
+
+
+def record_disclosure(db: sqlite_utils.Database, finding_id: str, disclosed_to: str, *, deadline: str | None) -> None:
+    """backs `python main.py disclose` — records who a Lane 1A finding was
+    reported to and when, alongside its existing disclosure_deadline."""
+    db["disclosure_log"].upsert(
+        {
+            "finding_id": finding_id,
+            "disclosed_to": disclosed_to,
+            "disclosed_at": now_iso(),
+            "deadline": deadline,
+            "cve_filed_at": None,
+            "cve_id_assigned": None,
+        },
+        pk="finding_id",
+    )
+
+
+def get_disclosure(db: sqlite_utils.Database, finding_id: str) -> dict[str, Any] | None:
+    rows = list(db["disclosure_log"].rows_where("finding_id = ?", [finding_id]))
+    return rows[0] if rows else None
+
+
+def list_disclosures(db: sqlite_utils.Database) -> list[dict[str, Any]]:
+    if "disclosure_log" not in db.table_names():
+        return []
+    return list(db["disclosure_log"].rows)

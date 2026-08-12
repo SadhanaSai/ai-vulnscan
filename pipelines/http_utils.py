@@ -9,6 +9,7 @@ standard that retry logic is consistent project-wide.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
 
@@ -16,6 +17,16 @@ import httpx
 from rich.console import Console
 
 console = Console()
+
+_COMMIT_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/commit/([0-9a-f]{7,40})")
+
+
+def parse_github_commit_url(url: str) -> tuple[str, str] | None:
+    """(repo, commit_sha) from a github.com/{repo}/commit/{sha} URL, or None
+    — shared by patterns/extractor.py and output/cve_drafter.py, both of
+    which need to recover the fix commit from a Finding.signal_url."""
+    match = _COMMIT_URL_RE.search(url or "")
+    return (match.group(1), match.group(2)) if match else None
 
 
 class RateLimiter:

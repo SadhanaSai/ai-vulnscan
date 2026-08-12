@@ -16,11 +16,14 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
+from hunter.scanner import run_pattern_hunt
 from llm.router import missing_api_key, resolve_provider_model
+from output.cve_drafter import run_cve_drafting
 from output.reporter import generate_report, write_report
+from patterns.extractor import run_pattern_extraction
 from pipelines.known_cve import load_watchlist, run_known_cve_pipeline
 from pipelines.pre_cve import run_pre_cve_pipeline, run_watch_queue
-from state.db import DEFAULT_DB_PATH, get_db, log_scan, status_summary
+from state.db import DEFAULT_DB_PATH, get_db, get_finding, list_patterns, log_scan, record_disclosure, status_summary
 
 load_dotenv()
 console = Console()
@@ -152,6 +155,39 @@ def _run_scan(targets: list[dict], *, dry_run: bool, llm_provider: str | None, l
                     dry_run=dry_run,
                 )
             )
+    # Phase 4/5 — extract patterns from any new Lane 1 commit findings, then
+    # immediately hunt those specific patterns across whatever was scanned
+    # this run (§8.5: "or automatically after any new pattern is added to
+    # the library"). Sibling-scan scope is bounded to `targets`, not the
+    # full watchlist — `python main.py hunt` covers full-library, full-
+    # watchlist runs on demand.
+    new_patterns = []
+    try:
+        pe_provider, _ = resolve_provider_model("pattern_extraction", provider=llm_provider, model=llm_model)
+    except ValueError as exc:
+        console.print(f"[yellow]warning:[/yellow] {exc} — skipping pattern extraction.")
+    else:
+        missing_env = missing_api_key(pe_provider)
+        if missing_env:
+            console.print(
+                f"[yellow]warning:[/yellow] {missing_env} not set for pattern_extraction provider {pe_provider!r} "
+                "— skipping pattern extraction."
+            )
+        elif github_token:
+            new_patterns = asyncio.run(
+                run_pattern_extraction(
+                    db=db, github_token=github_token, llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run
+                )
+            )
+            if new_patterns:
+                console.print(f"[green]{len(new_patterns)} new pattern(s) extracted.[/green] Hunting them across this run's packages...")
+                asyncio.run(
+                    run_pattern_hunt(
+                        targets, new_patterns, db=db, github_token=github_token,
+                        llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
+                    )
+                )
+
     duration = time.monotonic() - start
 
     findings_new = known_result.findings_new + (pre_cve_result.findings_new if pre_cve_result else 0)
@@ -205,10 +241,96 @@ def watch(dry_run: bool, llm_provider: str | None, llm_model: str | None) -> Non
 
 
 @cli.command()
-@click.option("--output", "output_path", default=None, help="Report output path (default: reports/YYYY-MM-DD.md)")
-def report(output_path: str | None) -> None:
-    """Generate a Markdown report from the current database state."""
+@click.option("--packages", "package_names", multiple=True, help="Hunt against specific packages only")
+@click.option(
+    "--layer",
+    type=click.Choice(["framework", "sdk", "mcp", "infrastructure"]),
+    default=None,
+    help="Hunt one layer only",
+)
+@click.option("--dry-run", is_flag=True, help="Run the hunt but do not write findings to the database")
+@click.option("--llm-provider", "llm_provider", default=None, help="Override the pattern_hunt LLM provider for this run")
+@click.option("--llm-model", "llm_model", default=None, help="Override the pattern_hunt LLM model for this run")
+def hunt(package_names: tuple[str, ...], layer: str | None, dry_run: bool, llm_provider: str | None, llm_model: str | None) -> None:
+    """Run the pattern hunter: scan watchlist packages' source for every
+    pattern currently in patterns/library.json."""
     db = get_db()
+    watchlist = load_watchlist()
+    targets = _filter_packages(watchlist, package_names, layer)
+    if not targets:
+        console.print("[yellow]No packages matched the given filters.[/yellow]")
+        return
+    patterns = list_patterns(db)
+    if not patterns:
+        console.print("[yellow]Pattern library is empty — nothing to hunt for yet.[/yellow] Run `scan` first to extract patterns from Lane 1 findings.")
+        return
+    github_token = os.environ.get("GITHUB_TOKEN")
+    console.print(f"Hunting {len(patterns)} pattern(s) across {len(targets)} package(s)...")
+    start = time.monotonic()
+    result = asyncio.run(
+        run_pattern_hunt(targets, patterns, db=db, github_token=github_token, llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run)
+    )
+    duration = time.monotonic() - start
+    log_scan(
+        db,
+        mode="hunt",
+        packages_scanned=result.scans_run,
+        findings_new=result.findings_new,
+        llm_calls_by_provider={llm_provider or "default": result.llm_calls} if result.llm_calls else {},
+        duration_seconds=duration,
+    )
+    suffix = " (dry run — not written to database)" if dry_run else ""
+    console.print(
+        f"[green]Done.[/green] {result.patterns_checked} pattern(s) checked, {result.candidates_scanned} candidate(s) scanned, "
+        f"{result.findings_new} new finding(s){suffix} in {duration:.1f}s."
+    )
+
+
+@cli.command()
+@click.option("--finding-id", "finding_id", required=True)
+@click.option("--to", "disclosed_to", required=True, help="Maintainer email or GitHub issue URL")
+def disclose(finding_id: str, disclosed_to: str) -> None:
+    """Mark a finding as disclosed — records who it was reported to; the
+    90-day CVE filing deadline is whatever was already set on the finding
+    when it was first triaged into Lane 1A."""
+    db = get_db()
+    finding = get_finding(db, finding_id)
+    if finding is None:
+        console.print(f"[red]error:[/red] no finding with id {finding_id!r}")
+        raise SystemExit(1)
+    record_disclosure(db, finding.id, disclosed_to, deadline=finding.disclosure_deadline)
+    console.print(f"[green]Recorded.[/green] {finding.package} ({finding.id[:12]}) disclosed to {disclosed_to}.")
+    if finding.disclosure_deadline:
+        console.print(f"CVE filing deadline: {finding.disclosure_deadline}")
+
+
+@cli.command()
+@click.option("--output", "output_path", default=None, help="Report output path (default: reports/YYYY-MM-DD.md)")
+@click.option("--llm-provider", "llm_provider", default=None, help="Override the cve_drafting LLM provider for this run")
+@click.option("--llm-model", "llm_model", default=None, help="Override the cve_drafting LLM model for this run")
+def report(output_path: str | None, llm_provider: str | None, llm_model: str | None) -> None:
+    """Generate a Markdown report from the current database state. Before
+    rendering, re-runs the §8.6 pre-file cross-check gate on every Lane 1
+    finding not yet ready_to_file — a fresh CVE match bumps it into the
+    CONFIRMED CVEs table instead; a clean check drafts the CVE text and
+    marks it ready_to_file."""
+    db = get_db()
+    github_token = os.environ.get("GITHUB_TOKEN")
+    try:
+        cd_provider, _ = resolve_provider_model("cve_drafting", provider=llm_provider, model=llm_model)
+    except ValueError as exc:
+        console.print(f"[yellow]warning:[/yellow] {exc} — skipping the pre-file cross-check/draft gate for this report.")
+    else:
+        missing_env = missing_api_key(cd_provider)
+        if missing_env:
+            console.print(
+                f"[yellow]warning:[/yellow] {missing_env} not set for cve_drafting provider {cd_provider!r} "
+                "— skipping the pre-file cross-check/draft gate for this report."
+            )
+        else:
+            console.print("Running pre-file cross-check gate on Lane 1 findings not yet ready to file...")
+            asyncio.run(run_cve_drafting(db=db, github_token=github_token, llm_provider=llm_provider, llm_model=llm_model))
+
     summary = status_summary(db)
     content = generate_report(
         db,

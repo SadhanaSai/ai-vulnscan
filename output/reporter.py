@@ -1,11 +1,10 @@
 """Markdown report generator — cve-agent-spec.md §11.
 
-CONFIRMED CVEs, READY TO FILE (Lane 1), and WATCH QUEUE (Lane 2, via the
-watch_queue table populated in Phase 3) are populated as of Phase 3.
-PATTERN LIBRARY DELTA / DISCLOSURE TRACKER still render as explicit
-placeholders until the phases that populate them (pattern extraction, CVE
-drafter) exist — an empty table would look like "we scanned and found
-nothing" instead of "this feature isn't built yet."
+All six sections are populated as of Phase 6: CONFIRMED CVEs, READY TO FILE
+(Lane 1 findings with status="ready_to_file" — set only by
+output/cve_drafter.py's pre-file cross-check gate, §8.6), WATCH QUEUE
+(Lane 2, Phase 3), PATTERN LIBRARY DELTA (Phase 4/5), and DISCLOSURE TRACKER
+(Phase 6, `python main.py disclose`).
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from typing import Any, Callable, Iterable
 
 import sqlite_utils
 
-from state.db import PROJECT_ROOT, Finding, list_findings
+from state.db import PROJECT_ROOT, Finding, list_findings, list_patterns
 
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports"
 
@@ -51,8 +50,12 @@ def _table_section(
 
 
 def _confirmed_cves_section(findings: list[Finding]) -> str:
+    # Includes original known-CVE-feed findings (lane="known") *and* Lane 1
+    # findings the §8.6 gate found already superseded by an existing CVE
+    # (status="closed", lane still "1A"/"1B", cve_id attached) — spec §8.6:
+    # "route the finding into the CONFIRMED CVEs report section".
     known = sorted(
-        (f for f in findings if f.lane == "known" and f.cve_id),
+        (f for f in findings if f.cve_id),
         key=lambda f: (-(f.cvss or 0), f.package),
     )
     return _table_section(
@@ -65,7 +68,7 @@ def _confirmed_cves_section(findings: list[Finding]) -> str:
             f.package,
             f.severity or "—",
             f.cvss if f.cvss is not None else "—",
-            _md_escape(f.summary),
+            _md_escape(f.summary) + (" _(superseded pre-CVE finding)_" if f.lane != "known" else ""),
             _md_escape(f.agentic_uplift) or "—",
             f.source,
         ],
@@ -75,7 +78,7 @@ def _confirmed_cves_section(findings: list[Finding]) -> str:
 def _ready_to_file_section(findings: list[Finding]) -> str:
     lines = ["## READY TO FILE (Lane 1 — Human review required)", ""]
     if not findings:
-        lines.append("_No Lane 1 findings from this run._")
+        lines.append("_No findings currently ready to file._")
         return "\n".join(lines)
     for f in findings:
         lines.append(f"### [{f.id[:12]}] Package: {f.package} | Severity: {f.severity or 'UNKNOWN'} | {', '.join(f.cwe) or 'CWE-?'}")
@@ -116,31 +119,42 @@ def _watch_queue_section(db: sqlite_utils.Database, findings: list[Finding]) -> 
 
 
 def _pattern_library_section(db: sqlite_utils.Database) -> str:
-    patterns = list(db["patterns"].rows) if "patterns" in db.table_names() else []
+    patterns = list_patterns(db)
     return _table_section(
         "PATTERN LIBRARY DELTA",
         patterns,
-        empty_message=(
-            "Pattern library is empty — pattern extraction isn't built until "
-            "Phase 4 (`patterns/extractor.py`). This section will populate once that phase lands."
-        ),
+        empty_message="Pattern library is empty — no Lane 1 commit-sourced findings have been extracted yet.",
         preamble=f"Total patterns in library: {len(patterns)}",
-        columns=["Pattern ID", "Class", "Source Finding", "Hits This Run"],
-        row_fn=lambda p: [p["id"], p["vulnerability_class"], p["source_finding_id"], "—"],
+        columns=["Pattern ID", "Class", "Source Finding", "Total Hits", "False Positives"],
+        row_fn=lambda p: [
+            p.id,
+            p.vulnerability_class,
+            (p.source_finding_id or "—")[:12],
+            len(p.confirmed_hits),
+            p.false_positives,
+        ],
     )
 
 
-def _disclosure_tracker_section(db: sqlite_utils.Database) -> str:
+def _disclosure_tracker_section(db: sqlite_utils.Database, findings_by_id: dict[str, Finding]) -> str:
     entries = list(db["disclosure_log"].rows) if "disclosure_log" in db.table_names() else []
+
+    def _row(e: dict[str, Any]) -> list[Any]:
+        f = findings_by_id.get(e["finding_id"])
+        return [
+            e["finding_id"][:12],
+            f.package if f else "—",
+            e["disclosed_to"] or "—",
+            e["deadline"] or "—",
+            f.status if f else "—",
+        ]
+
     return _table_section(
         "DISCLOSURE TRACKER",
         entries,
-        empty_message=(
-            "No open disclosures — the disclosure tracker isn't built until "
-            "Phase 6 (`output/cve_drafter.py`). This section will populate once that phase lands."
-        ),
+        empty_message="No open disclosures yet.",
         columns=["Finding ID", "Package", "Disclosed To", "Deadline", "Status"],
-        row_fn=lambda e: [e["finding_id"], "—", e["disclosed_to"], e["deadline"], "—"],
+        row_fn=_row,
     )
 
 
@@ -148,7 +162,8 @@ def generate_report(db: sqlite_utils.Database, *, mode: str, packages_scanned: i
     # One fetch of the findings table, partitioned in memory, instead of a
     # separate filtered query per section.
     all_findings = list_findings(db)
-    lane1_findings = [f for f in all_findings if f.lane in ("1A", "1B")]
+    findings_by_id = {f.id: f for f in all_findings}
+    ready_to_file_findings = [f for f in all_findings if f.status == "ready_to_file"]
     lane2_findings = [f for f in all_findings if f.lane == "2"]
 
     sections = [
@@ -160,7 +175,7 @@ def generate_report(db: sqlite_utils.Database, *, mode: str, packages_scanned: i
         "",
         "---",
         "",
-        _ready_to_file_section(lane1_findings),
+        _ready_to_file_section(ready_to_file_findings),
         "",
         "---",
         "",
@@ -176,7 +191,7 @@ def generate_report(db: sqlite_utils.Database, *, mode: str, packages_scanned: i
         "",
         "---",
         "",
-        _disclosure_tracker_section(db),
+        _disclosure_tracker_section(db, findings_by_id),
         "",
     ]
     return "\n".join(sections)
