@@ -25,11 +25,13 @@ from pipelines.http_utils import RateLimiter, console, request_with_retry
 from pipelines.known_cve import cross_check_existing_cve, query_osv
 from state.db import (
     Finding,
+    ScanProgress,
     bump_watch_check,
     due_watch_items,
     get_finding,
     make_finding_id,
     now_iso,
+    record_scan_progress,
     remove_from_watch_queue,
     schedule_watch_check,
     upsert_finding,
@@ -357,14 +359,17 @@ class WatchScanResult:
     llm_calls: int = 0
 
 
-async def _guarded(coro: Any, pkg_name: str, description: str) -> None:
+async def _guarded(coro: Any, pkg_name: str, description: str) -> bool | None:
     """A single signal's cross-check/triage failure (LLM provider
     unreachable, malformed response, etc.) must not abort the rest of the
-    scan — it isn't persisted, so it's simply retried on the next run."""
+    scan — it isn't persisted, so it's simply retried on the next run.
+    Returns the wrapped coroutine's result (whether it persisted a new
+    finding) on success, or None if it was caught and skipped."""
     try:
-        await coro
+        return await coro
     except Exception as exc:
         console.print(f"[yellow]warning:[/yellow] skipping signal {description} for {pkg_name!r}: {exc}")
+        return None
 
 
 async def run_pre_cve_pipeline(
@@ -377,6 +382,7 @@ async def run_pre_cve_pipeline(
     llm_model: str | None = None,
     concurrency: int = 4,
     dry_run: bool = False,
+    run_id: int | None = None,
 ) -> PreCveScanResult:
     result = PreCveScanResult()
     if not github_token:
@@ -408,10 +414,13 @@ async def run_pre_cve_pipeline(
         signal_type: str,
         signal_content: str,
         commit_sha: str | None = None,
-    ) -> None:
+    ) -> bool:
+        """Returns True iff a new finding was persisted — lets callers count
+        per-package findings without racing the shared result.findings_new
+        counter across concurrently-running packages."""
         finding_id = make_finding_id(pkg["name"], source, signal_url)
         if finding_id in existing_ids:
-            return
+            return False
 
         # §8.2a — mandatory, before this signal is allowed anywhere near triage.
         cve_id = await cross_check_existing_cve(
@@ -441,7 +450,7 @@ async def run_pre_cve_pipeline(
             if not dry_run:
                 upsert_finding(db, finding)
             result.findings_new += 1
-            return
+            return True
 
         triage_result = await triage_signal(
             package=pkg["name"],
@@ -455,7 +464,7 @@ async def run_pre_cve_pipeline(
         )
         result.llm_calls += 1
         if triage_result["lane"] == "3":
-            return  # noise — discarded, not persisted (CLAUDE.md lane table)
+            return False  # noise — discarded, not persisted (CLAUDE.md lane table)
 
         finding = build_finding(
             package=pkg["name"],
@@ -471,16 +480,17 @@ async def run_pre_cve_pipeline(
             if finding.lane == "2":
                 schedule_watch_check(db, finding.id)
         result.findings_new += 1
+        return True
 
-    async def process_commit(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> None:
+    async def process_commit(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> bool:
         sha = item.get("sha")
         signal_url = item.get("html_url")
         if not sha or not signal_url:
-            return
+            return False
         path_prefix = pkg.get("path_prefix")
         if path_prefix and not await _commit_touches_path(client, pkg["repo"], sha, path_prefix, token=github_token):
-            return
-        await handle_signal(
+            return False
+        return await handle_signal(
             client,
             pkg,
             source="github_commit",
@@ -491,14 +501,14 @@ async def run_pre_cve_pipeline(
             commit_sha=sha,
         )
 
-    async def process_issue(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> None:
+    async def process_issue(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> bool:
         signal_url = item.get("html_url")
         if not signal_url:
-            return
+            return False
         path_prefix = pkg.get("path_prefix")
         if path_prefix and not _issue_mentions_path_component(item, path_prefix):
-            return
-        await handle_signal(
+            return False
+        return await handle_signal(
             client,
             pkg,
             source="github_issue",
@@ -508,15 +518,15 @@ async def run_pre_cve_pipeline(
             signal_content=_issue_to_signal_content(item),
         )
 
-    async def process_pr(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> None:
+    async def process_pr(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> bool:
         signal_url = item.get("html_url")
         if not signal_url:
-            return
+            return False
         path_prefix = pkg.get("path_prefix")
         number = item.get("number")
         if path_prefix and number and not await _pr_touches_path(client, pkg["repo"], number, path_prefix, token=github_token):
-            return
-        await handle_signal(
+            return False
+        return await handle_signal(
             client,
             pkg,
             source="github_pr",
@@ -526,11 +536,11 @@ async def run_pre_cve_pipeline(
             signal_content=_issue_to_signal_content(item),
         )
 
-    async def process_hn(client: httpx.AsyncClient, pkg: dict[str, Any], hit: dict[str, Any]) -> None:
+    async def process_hn(client: httpx.AsyncClient, pkg: dict[str, Any], hit: dict[str, Any]) -> bool:
         signal_url = _hn_signal_url(hit)
         if not signal_url:
-            return
-        await handle_signal(
+            return False
+        return await handle_signal(
             client,
             pkg,
             source="hackernews",
@@ -540,8 +550,8 @@ async def run_pre_cve_pipeline(
             signal_content=_hn_to_signal_content(hit),
         )
 
-    async def process_dependency(client: httpx.AsyncClient, pkg: dict[str, Any], signal: dict[str, Any]) -> None:
-        await handle_signal(
+    async def process_dependency(client: httpx.AsyncClient, pkg: dict[str, Any], signal: dict[str, Any]) -> bool:
+        return await handle_signal(
             client,
             pkg,
             source="dependency_cve",
@@ -555,42 +565,74 @@ async def run_pre_cve_pipeline(
 
         async def process(pkg: dict[str, Any]) -> None:
             async with semaphore:
-                commit_items = await search_commits(
-                    client, pkg["repo"], token=github_token, rate_limiter=search_limiter, since=since
-                )
-                result.commits_seen += len(commit_items)
-                for item in commit_items:
-                    await _guarded(process_commit(client, pkg, item), pkg["name"], item.get("html_url", item.get("sha", "?")))
-
-                issue_items = await search_security_issues(
-                    client, pkg["repo"], token=github_token, rate_limiter=search_limiter, since=since
-                )
-                result.issues_seen += len(issue_items)
-                for item in issue_items:
-                    await _guarded(process_issue(client, pkg, item), pkg["name"], item.get("html_url", "?"))
-
-                pr_items = await search_security_prs(
-                    client, pkg["repo"], token=github_token, rate_limiter=search_limiter, since=since
-                )
-                result.prs_seen += len(pr_items)
-                for item in pr_items:
-                    await _guarded(process_pr(client, pkg, item), pkg["name"], item.get("html_url", "?"))
-
-                hn_hits = await search_hackernews(client, pkg["name"], rate_limiter=hn_limiter, since=hn_since)
-                result.hn_hits_seen += len(hn_hits)
-                for hit in hn_hits:
-                    await _guarded(process_hn(client, pkg, hit), pkg["name"], hit.get("objectID", "?"))
-
+                pkg_new = 0
                 try:
-                    dep_signals = await scan_dependency_exposure(client, pkg)
-                except Exception as exc:
-                    console.print(f"[yellow]warning:[/yellow] dependency scan failed for {pkg['name']!r}: {exc}")
-                    dep_signals = []
-                result.dependency_signals_seen += len(dep_signals)
-                for sig in dep_signals:
-                    await _guarded(process_dependency(client, pkg, sig), pkg["name"], sig.get("dependency", "?"))
+                    commit_items = await search_commits(
+                        client, pkg["repo"], token=github_token, rate_limiter=search_limiter, since=since
+                    )
+                    result.commits_seen += len(commit_items)
+                    for item in commit_items:
+                        if await _guarded(
+                            process_commit(client, pkg, item), pkg["name"], item.get("html_url", item.get("sha", "?"))
+                        ):
+                            pkg_new += 1
 
-                result.packages_scanned += 1
+                    issue_items = await search_security_issues(
+                        client, pkg["repo"], token=github_token, rate_limiter=search_limiter, since=since
+                    )
+                    result.issues_seen += len(issue_items)
+                    for item in issue_items:
+                        if await _guarded(process_issue(client, pkg, item), pkg["name"], item.get("html_url", "?")):
+                            pkg_new += 1
+
+                    pr_items = await search_security_prs(
+                        client, pkg["repo"], token=github_token, rate_limiter=search_limiter, since=since
+                    )
+                    result.prs_seen += len(pr_items)
+                    for item in pr_items:
+                        if await _guarded(process_pr(client, pkg, item), pkg["name"], item.get("html_url", "?")):
+                            pkg_new += 1
+
+                    hn_hits = await search_hackernews(client, pkg["name"], rate_limiter=hn_limiter, since=hn_since)
+                    result.hn_hits_seen += len(hn_hits)
+                    for hit in hn_hits:
+                        if await _guarded(process_hn(client, pkg, hit), pkg["name"], hit.get("objectID", "?")):
+                            pkg_new += 1
+
+                    try:
+                        dep_signals = await scan_dependency_exposure(client, pkg)
+                    except Exception as exc:
+                        console.print(f"[yellow]warning:[/yellow] dependency scan failed for {pkg['name']!r}: {exc}")
+                        dep_signals = []
+                    result.dependency_signals_seen += len(dep_signals)
+                    for sig in dep_signals:
+                        if await _guarded(process_dependency(client, pkg, sig), pkg["name"], sig.get("dependency", "?")):
+                            pkg_new += 1
+
+                    result.packages_scanned += 1
+                except Exception as exc:
+                    # Mirrors run_known_cve_pipeline(): one package's unhandled
+                    # failure (e.g. search_commits/search_hackernews itself
+                    # raising — the per-item _guarded() calls above only cover
+                    # per-signal failures, not the search calls themselves)
+                    # must not abort asyncio.gather() for the other packages.
+                    if run_id is not None and not dry_run:
+                        record_scan_progress(
+                            db,
+                            ScanProgress(
+                                run_id=run_id, package=pkg["name"], phase="pre_cve",
+                                status="error", error=str(exc)[:500],
+                            ),
+                        )
+                    return
+                if run_id is not None and not dry_run:
+                    record_scan_progress(
+                        db,
+                        ScanProgress(
+                            run_id=run_id, package=pkg["name"], phase="pre_cve",
+                            status="done", findings_new=pkg_new,
+                        ),
+                    )
 
         await asyncio.gather(*(process(p) for p in targets))
 

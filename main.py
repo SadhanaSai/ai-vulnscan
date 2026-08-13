@@ -27,12 +27,18 @@ from pipelines.pre_cve import run_pre_cve_pipeline, run_watch_queue
 from state.db import (
     DEFAULT_DB_PATH,
     DynamicValidationRun,
+    ScanRun,
+    finish_scan_run,
     get_db,
     get_finding,
+    get_scan_run,
+    latest_scan_run,
     list_patterns,
+    list_scan_progress,
     log_scan,
     record_disclosure,
     record_validation_run,
+    start_scan_run,
     status_summary,
 )
 from validation._shared import ValidationOutcome
@@ -81,6 +87,51 @@ def scan(package_names: tuple[str, ...], layer: str | None, dry_run: bool, llm_p
         console.print("[yellow]No packages matched the given filters.[/yellow]")
         return
     _run_scan(targets, dry_run=dry_run, llm_provider=llm_provider, llm_model=llm_model)
+
+
+@cli.command(name="scan-status")
+@click.option("--run-id", "run_id_opt", type=int, default=None, help="Show a specific run (default: most recent)")
+def scan_status(run_id_opt: int | None) -> None:
+    """Show per-package checkpoint progress for a `scan` run — safe to run
+    while a scan is still in progress (reads committed rows only), and the
+    only way to see what a scan actually got done if it died mid-run
+    without ever reaching its final summary line."""
+    db = get_db()
+    run = get_scan_run(db, run_id_opt) if run_id_opt is not None else latest_scan_run(db)
+    if run is None:
+        console.print("[yellow]No scan runs recorded yet.[/yellow] Run `python main.py scan` first.")
+        return
+
+    status_color = {"running": "yellow", "complete": "green", "failed": "red"}.get(run.status, "white")
+    console.print(
+        f"Run #{run.id} [{status_color}]{run.status}[/{status_color}] — mode={run.mode} "
+        f"provider={run.llm_provider or '—'} started={run.started_at} finished={run.finished_at or '—'}"
+    )
+
+    progress = list_scan_progress(db, run.id)
+    by_phase: dict[str, list] = {}
+    for p in progress:
+        by_phase.setdefault(p.phase, []).append(p)
+
+    for phase in ("known_cve", "pre_cve"):
+        rows = by_phase.get(phase, [])
+        done = [r for r in rows if r.status == "done"]
+        errored = [r for r in rows if r.status == "error"]
+        pending = run.packages_total - len(rows)
+        console.print(
+            f"  {phase}: {len(done)} done, {len(errored)} errored, {pending} pending "
+            f"(of {run.packages_total} targeted)"
+        )
+
+    errored = [p for p in progress if p.status == "error"]
+    if errored:
+        table = Table(title="Errored packages")
+        table.add_column("Package")
+        table.add_column("Phase")
+        table.add_column("Error")
+        for p in errored:
+            table.add_row(p.package, p.phase, (p.error or "")[:200])
+        console.print(table)
 
 
 @cli.command(name="scan-repo")
@@ -136,92 +187,113 @@ def _run_scan(targets: list[dict], *, dry_run: bool, llm_provider: str | None, l
         )
 
     db = get_db()
+    # Per-package checkpointing: created before any pipeline work starts, so
+    # `scan-status` has something to show even if this process dies mid-run
+    # — see `run_id` threaded into both pipeline calls below and their own
+    # per-package checkpoint writes (state/db.py ScanProgress).
+    run_id: int | None = None
+    if not dry_run:
+        run = start_scan_run(
+            db, ScanRun(mode="scan", packages_total=len(targets), llm_provider=llm_provider or "default")
+        )
+        run_id = run.id
+
     console.print(f"Scanning {len(targets)} package(s) against NVD, OSV.dev, and GHSA...")
     start = time.monotonic()
-    known_result = asyncio.run(
-        run_known_cve_pipeline(
-            targets,
-            db=db,
-            github_token=github_token,
-            nvd_api_key=nvd_api_key,
-            dry_run=dry_run,
+    try:
+        known_result = asyncio.run(
+            run_known_cve_pipeline(
+                targets,
+                db=db,
+                github_token=github_token,
+                nvd_api_key=nvd_api_key,
+                dry_run=dry_run,
+                run_id=run_id,
+            )
         )
-    )
 
-    pre_cve_result = None
-    try:
-        resolved_provider, _ = resolve_provider_model("triage", provider=llm_provider, model=llm_model)
-    except ValueError as exc:
-        console.print(f"[yellow]warning:[/yellow] {exc} — skipping pre-CVE commit scan.")
-    else:
-        missing_env = missing_api_key(resolved_provider)
-        if missing_env:
-            console.print(
-                f"[yellow]warning:[/yellow] {missing_env} not set for triage provider {resolved_provider!r} "
-                "— skipping pre-CVE commit scan."
-            )
-        elif github_token:
-            console.print(f"Scanning commit history for pre-CVE signals (triage provider: {resolved_provider})...")
-            pre_cve_result = asyncio.run(
-                run_pre_cve_pipeline(
-                    targets,
-                    db=db,
-                    github_token=github_token,
-                    llm_provider=llm_provider,
-                    llm_model=llm_model,
-                    dry_run=dry_run,
+        pre_cve_result = None
+        try:
+            resolved_provider, _ = resolve_provider_model("triage", provider=llm_provider, model=llm_model)
+        except ValueError as exc:
+            console.print(f"[yellow]warning:[/yellow] {exc} — skipping pre-CVE commit scan.")
+        else:
+            missing_env = missing_api_key(resolved_provider)
+            if missing_env:
+                console.print(
+                    f"[yellow]warning:[/yellow] {missing_env} not set for triage provider {resolved_provider!r} "
+                    "— skipping pre-CVE commit scan."
                 )
-            )
-    # Phase 4/5 — extract patterns from any new Lane 1 commit findings, then
-    # immediately hunt those specific patterns across whatever was scanned
-    # this run (§8.5: "or automatically after any new pattern is added to
-    # the library"). Sibling-scan scope is bounded to `targets`, not the
-    # full watchlist — `python main.py hunt` covers full-library, full-
-    # watchlist runs on demand.
-    new_patterns = []
-    try:
-        pe_provider, _ = resolve_provider_model("pattern_extraction", provider=llm_provider, model=llm_model)
-    except ValueError as exc:
-        console.print(f"[yellow]warning:[/yellow] {exc} — skipping pattern extraction.")
-    else:
-        missing_env = missing_api_key(pe_provider)
-        if missing_env:
-            console.print(
-                f"[yellow]warning:[/yellow] {missing_env} not set for pattern_extraction provider {pe_provider!r} "
-                "— skipping pattern extraction."
-            )
-        elif github_token:
-            watchlist_for_extraction = load_watchlist()
-            package_to_repo = {p["name"]: p["repo"] for p in watchlist_for_extraction if p.get("repo")}
-            package_to_path_prefix = {p["name"]: p["path_prefix"] for p in watchlist_for_extraction if p.get("path_prefix")}
-            new_patterns = asyncio.run(
-                run_pattern_extraction(
-                    db=db, github_token=github_token, package_to_repo=package_to_repo,
-                    package_to_path_prefix=package_to_path_prefix,
-                    llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
+            elif github_token:
+                console.print(f"Scanning commit history for pre-CVE signals (triage provider: {resolved_provider})...")
+                pre_cve_result = asyncio.run(
+                    run_pre_cve_pipeline(
+                        targets,
+                        db=db,
+                        github_token=github_token,
+                        llm_provider=llm_provider,
+                        llm_model=llm_model,
+                        dry_run=dry_run,
+                        run_id=run_id,
+                    )
                 )
-            )
-            if new_patterns:
-                console.print(f"[green]{len(new_patterns)} new pattern(s) extracted.[/green] Hunting them across this run's packages...")
-                asyncio.run(
-                    run_pattern_hunt(
-                        targets, new_patterns, db=db, github_token=github_token,
+        # Phase 4/5 — extract patterns from any new Lane 1 commit findings, then
+        # immediately hunt those specific patterns across whatever was scanned
+        # this run (§8.5: "or automatically after any new pattern is added to
+        # the library"). Sibling-scan scope is bounded to `targets`, not the
+        # full watchlist — `python main.py hunt` covers full-library, full-
+        # watchlist runs on demand.
+        new_patterns = []
+        try:
+            pe_provider, _ = resolve_provider_model("pattern_extraction", provider=llm_provider, model=llm_model)
+        except ValueError as exc:
+            console.print(f"[yellow]warning:[/yellow] {exc} — skipping pattern extraction.")
+        else:
+            missing_env = missing_api_key(pe_provider)
+            if missing_env:
+                console.print(
+                    f"[yellow]warning:[/yellow] {missing_env} not set for pattern_extraction provider {pe_provider!r} "
+                    "— skipping pattern extraction."
+                )
+            elif github_token:
+                watchlist_for_extraction = load_watchlist()
+                package_to_repo = {p["name"]: p["repo"] for p in watchlist_for_extraction if p.get("repo")}
+                package_to_path_prefix = {p["name"]: p["path_prefix"] for p in watchlist_for_extraction if p.get("path_prefix")}
+                new_patterns = asyncio.run(
+                    run_pattern_extraction(
+                        db=db, github_token=github_token, package_to_repo=package_to_repo,
+                        package_to_path_prefix=package_to_path_prefix,
                         llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
                     )
                 )
+                if new_patterns:
+                    console.print(f"[green]{len(new_patterns)} new pattern(s) extracted.[/green] Hunting them across this run's packages...")
+                    asyncio.run(
+                        run_pattern_hunt(
+                            targets, new_patterns, db=db, github_token=github_token,
+                            llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
+                        )
+                    )
 
-    duration = time.monotonic() - start
+        duration = time.monotonic() - start
 
-    findings_new = known_result.findings_new + (pre_cve_result.findings_new if pre_cve_result else 0)
-    llm_calls = pre_cve_result.llm_calls if pre_cve_result else 0
-    log_scan(
-        db,
-        mode="scan",
-        packages_scanned=known_result.packages_scanned,
-        findings_new=findings_new,
-        llm_calls_by_provider={resolved_provider: llm_calls} if pre_cve_result else {},
-        duration_seconds=duration,
-    )
+        findings_new = known_result.findings_new + (pre_cve_result.findings_new if pre_cve_result else 0)
+        llm_calls = pre_cve_result.llm_calls if pre_cve_result else 0
+        log_scan(
+            db,
+            mode="scan",
+            packages_scanned=known_result.packages_scanned,
+            findings_new=findings_new,
+            llm_calls_by_provider={resolved_provider: llm_calls} if pre_cve_result else {},
+            duration_seconds=duration,
+        )
+    except Exception:
+        if run_id is not None:
+            finish_scan_run(db, run_id, status="failed")
+        raise
+    else:
+        if run_id is not None:
+            finish_scan_run(db, run_id, status="complete")
 
     suffix = " (dry run — not written to database)" if dry_run else ""
     console.print(

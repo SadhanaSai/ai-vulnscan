@@ -106,6 +106,28 @@ CREATE TABLE IF NOT EXISTS dynamic_validation_runs (  -- Phase 7, §8.7 — appe
     log TEXT,                   -- full command + output audit trail, nothing redacted
     FOREIGN KEY (finding_id) REFERENCES findings(id)
 );
+
+CREATE TABLE IF NOT EXISTS scan_runs (  -- per-package checkpointing for `scan`
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mode TEXT NOT NULL,            -- "scan" (matches log_scan's mode values)
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,          -- "running" | "complete" | "failed"
+    packages_total INTEGER NOT NULL,
+    llm_provider TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scan_progress (  -- append-only, one row per (run, package, phase)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    package TEXT NOT NULL,
+    phase TEXT NOT NULL,           -- "known_cve" | "pre_cve"
+    status TEXT NOT NULL,          -- "done" | "error"
+    findings_new INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    completed_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES scan_runs(id)
+);
 """
 
 # Finding fields that are stored as JSON text and need encode/decode at the boundary.
@@ -225,6 +247,54 @@ class DynamicValidationRun:
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "DynamicValidationRun":
+        return cls(**dict(row))
+
+
+@dataclass
+class ScanRun:
+    """One `python main.py scan` invocation — created at the start so
+    per-package progress (ScanProgress) has something to hang off of even
+    if the process dies before the run finishes normally."""
+
+    mode: str
+    packages_total: int
+    llm_provider: str | None = None
+    status: str = "running"  # "running" | "complete" | "failed"
+    started_at: str = field(default_factory=now_iso)
+    finished_at: str | None = None
+    id: int | None = None
+
+    def to_row(self) -> dict[str, Any]:
+        row = asdict(self)
+        row.pop("id")
+        return row
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "ScanRun":
+        return cls(**dict(row))
+
+
+@dataclass
+class ScanProgress:
+    """Append-only: one row per (run, package, phase) as each package
+    finishes — the actual checkpoint. Never touches Finding/scan_log."""
+
+    run_id: int
+    package: str
+    phase: str  # "known_cve" | "pre_cve"
+    status: str  # "done" | "error"
+    findings_new: int = 0
+    error: str | None = None
+    completed_at: str = field(default_factory=now_iso)
+    id: int | None = None
+
+    def to_row(self) -> dict[str, Any]:
+        row = asdict(self)
+        row.pop("id")
+        return row
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "ScanProgress":
         return cls(**dict(row))
 
 
@@ -459,3 +529,39 @@ def all_latest_validation_runs(db: sqlite_utils.Database) -> dict[str, DynamicVa
     for row in db["dynamic_validation_runs"].rows_where(order_by="requested_at"):
         latest[row["finding_id"]] = DynamicValidationRun.from_row(row)
     return latest
+
+
+# --- scan checkpointing (per-package progress for `python main.py scan`) -----
+
+
+def start_scan_run(db: sqlite_utils.Database, run: ScanRun) -> ScanRun:
+    run.id = db["scan_runs"].insert(run.to_row()).last_pk
+    return run
+
+
+def finish_scan_run(db: sqlite_utils.Database, run_id: int, *, status: str) -> None:
+    db["scan_runs"].update(run_id, {"status": status, "finished_at": now_iso()})
+
+
+def get_scan_run(db: sqlite_utils.Database, run_id: int) -> ScanRun | None:
+    rows = list(db["scan_runs"].rows_where("id = ?", [run_id]))
+    return ScanRun.from_row(rows[0]) if rows else None
+
+
+def latest_scan_run(db: sqlite_utils.Database) -> ScanRun | None:
+    if "scan_runs" not in db.table_names():
+        return None
+    rows = list(db["scan_runs"].rows_where(order_by="-id", limit=1))
+    return ScanRun.from_row(rows[0]) if rows else None
+
+
+def record_scan_progress(db: sqlite_utils.Database, progress: ScanProgress) -> ScanProgress:
+    progress.id = db["scan_progress"].insert(progress.to_row()).last_pk
+    return progress
+
+
+def list_scan_progress(db: sqlite_utils.Database, run_id: int) -> list[ScanProgress]:
+    if "scan_progress" not in db.table_names():
+        return []
+    rows = db["scan_progress"].rows_where("run_id = ?", [run_id], order_by="id")
+    return [ScanProgress.from_row(r) for r in rows]

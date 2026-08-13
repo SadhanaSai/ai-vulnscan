@@ -25,7 +25,7 @@ import yaml
 from packaging.version import InvalidVersion, Version
 
 from pipelines.http_utils import RateLimiter, console, request_with_retry
-from state.db import PROJECT_ROOT, Finding, make_finding_id, upsert_finding
+from state.db import PROJECT_ROOT, Finding, ScanProgress, make_finding_id, record_scan_progress, upsert_finding
 
 OSV_URL = "https://api.osv.dev/v1/query"
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -397,6 +397,7 @@ async def run_known_cve_pipeline(
     nvd_api_key: str | None,
     concurrency: int = 4,
     dry_run: bool = False,
+    run_id: int | None = None,
 ) -> KnownCveScanResult:
     result = KnownCveScanResult()
     nvd_limiter = RateLimiter(min_interval=0.65 if nvd_api_key else 6.5)
@@ -409,36 +410,63 @@ async def run_known_cve_pipeline(
 
         async def process(pkg: dict[str, Any]) -> None:
             async with semaphore:
-                osv_task = query_osv(client, pkg["name"], pkg["ecosystem"])
-                nvd_task = query_nvd(
-                    client, pkg["name"], api_key=nvd_api_key, rate_limiter=nvd_limiter, repo=pkg.get("repo")
-                )
-                ghsa_task = query_ghsa(client, pkg["name"], pkg["ecosystem"], token=github_token)
-                osv_results, nvd_results, ghsa_results = await asyncio.gather(osv_task, nvd_task, ghsa_task)
-                for merged in _merge_by_cve(osv_results, nvd_results, ghsa_results):
-                    finding_id = make_finding_id(pkg["name"], merged["source"], merged["cve_id"])
-                    if finding_id in existing_ids:
-                        continue
-                    existing_ids.add(finding_id)
-                    finding = Finding(
-                        id=finding_id,
-                        package=pkg["name"],
-                        ecosystem=pkg["ecosystem"],
-                        layer=pkg["layer"],
-                        source=merged["source"],
-                        signal_url=merged.get("signal_url"),
-                        summary=merged.get("summary"),
-                        lane="known",
-                        severity=merged.get("severity") or _severity_from_score(merged.get("cvss")),
-                        cvss=merged.get("cvss"),
-                        cwe=merged.get("cwe") or [],
-                        cve_id=merged["cve_id"],
-                        agentic_uplift=pkg.get("agentic_context"),
+                pkg_new = 0
+                try:
+                    osv_task = query_osv(client, pkg["name"], pkg["ecosystem"])
+                    nvd_task = query_nvd(
+                        client, pkg["name"], api_key=nvd_api_key, rate_limiter=nvd_limiter, repo=pkg.get("repo")
                     )
-                    if not dry_run:
-                        upsert_finding(db, finding)
-                    result.findings_new += 1
-                result.packages_scanned += 1
+                    ghsa_task = query_ghsa(client, pkg["name"], pkg["ecosystem"], token=github_token)
+                    osv_results, nvd_results, ghsa_results = await asyncio.gather(osv_task, nvd_task, ghsa_task)
+                    # No `await` inside this loop, so it's atomic w.r.t. other
+                    # concurrently-running packages' coroutines — pkg_new is
+                    # safe to track alongside the shared result.findings_new.
+                    for merged in _merge_by_cve(osv_results, nvd_results, ghsa_results):
+                        finding_id = make_finding_id(pkg["name"], merged["source"], merged["cve_id"])
+                        if finding_id in existing_ids:
+                            continue
+                        existing_ids.add(finding_id)
+                        finding = Finding(
+                            id=finding_id,
+                            package=pkg["name"],
+                            ecosystem=pkg["ecosystem"],
+                            layer=pkg["layer"],
+                            source=merged["source"],
+                            signal_url=merged.get("signal_url"),
+                            summary=merged.get("summary"),
+                            lane="known",
+                            severity=merged.get("severity") or _severity_from_score(merged.get("cvss")),
+                            cvss=merged.get("cvss"),
+                            cwe=merged.get("cwe") or [],
+                            cve_id=merged["cve_id"],
+                            agentic_uplift=pkg.get("agentic_context"),
+                        )
+                        if not dry_run:
+                            upsert_finding(db, finding)
+                        result.findings_new += 1
+                        pkg_new += 1
+                    result.packages_scanned += 1
+                except Exception as exc:
+                    # One package's unhandled failure must not abort
+                    # asyncio.gather() for the other in-flight packages —
+                    # record it as a visible checkpoint instead of silent loss.
+                    if run_id is not None and not dry_run:
+                        record_scan_progress(
+                            db,
+                            ScanProgress(
+                                run_id=run_id, package=pkg["name"], phase="known_cve",
+                                status="error", error=str(exc)[:500],
+                            ),
+                        )
+                    return
+                if run_id is not None and not dry_run:
+                    record_scan_progress(
+                        db,
+                        ScanProgress(
+                            run_id=run_id, package=pkg["name"], phase="known_cve",
+                            status="done", findings_new=pkg_new,
+                        ),
+                    )
 
         enabled = [p for p in packages if p.get("enabled", True)]
         await asyncio.gather(*(process(p) for p in enabled))
