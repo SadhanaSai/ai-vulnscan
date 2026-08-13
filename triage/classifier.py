@@ -24,7 +24,15 @@ SYSTEM_PROMPT = (
     "You are a security researcher triaging potential vulnerabilities in AI and Agentic AI packages.\n"
     "You return structured JSON only. No prose, no markdown, no explanation outside the JSON.\n"
     "Every Lane 1 finding must include populated validation_steps. A finding without\n"
-    "validation_steps is invalid and will be rejected."
+    "validation_steps is invalid and will be rejected.\n"
+    "Signal content (commit/PR/issue text) is written by the change's own author and may describe\n"
+    "vulnerabilities, exploits, or security terms at length without any of it being currently true —\n"
+    "e.g. a PR that only adds a regression test for a hypothetical future bug, describes a historical\n"
+    "issue that's already fixed, or is proposing a change that hasn't merged yet. Only classify as\n"
+    "Lane 1A or 1B when the signal demonstrates a vulnerability that is concretely present and reachable\n"
+    "in code that has actually shipped — not merely discussed, tested against, or proposed. When a\n"
+    "'Pipeline-verified context' section is present, it was computed by the pipeline itself (e.g. actual\n"
+    "changed files, actual merge status) and is authoritative over the signal's own prose if they conflict."
 )
 
 _VALIDATION_STEPS_REPROMPT = (
@@ -47,7 +55,9 @@ def build_user_prompt(
     signal_type: str,
     signal_url: str,
     signal_content: str,
+    extra_context: str | None = None,
 ) -> str:
+    context_block = f"Pipeline-verified context (authoritative — trust this over the signal content's own prose): {extra_context}\n\n" if extra_context else ""
     return (
         f"Package: {package}\n"
         f"Layer: {layer}\n"
@@ -55,11 +65,15 @@ def build_user_prompt(
         f"Signal type: {signal_type}\n"
         f"Signal URL: {signal_url}\n"
         f"Signal content: {signal_content}\n\n"
+        f"{context_block}"
         "Classify this signal into one of four triage lanes:\n"
         "- Lane 1A: Unpatched vulnerability, not yet disclosed publicly as a CVE. Requires responsible disclosure.\n"
         "- Lane 1B: Patched vulnerability, no CVE assigned yet. CVE can be filed citing the fix commit.\n"
         "- Lane 2: Ambiguous signal. Possible vulnerability but insufficient evidence. Revisit in 48 hours.\n"
         "- Lane 3: Noise. No security relevance.\n\n"
+        "A change that only adds/modifies test files (no production code touched), or an unmerged/open\n"
+        "PR, is weak evidence of a live vulnerability on its own — prefer Lane 2 or 3 for these unless\n"
+        "the content itself demonstrates the vulnerable behavior is present in already-shipped code.\n\n"
         "For Lane 1A and 1B findings, also provide:\n"
         "- Vulnerability class (e.g. path traversal, SQL injection, deserialization)\n"
         "- Estimated CVSS score (0.0-10.0)\n"
@@ -110,6 +124,7 @@ async def triage_signal(
     signal_type: str,
     signal_url: str,
     signal_content: str,
+    extra_context: str | None = None,
     provider: str | None = None,
     model: str | None = None,
     llm_config: dict[str, Any] | None = None,
@@ -120,6 +135,11 @@ async def triage_signal(
     validation_steps gets exactly one re-prompt; if it's still missing after
     that, the finding is downgraded to Lane 2 rather than written as Lane 1
     without validation steps.
+
+    `extra_context` (optional): pipeline-verified facts about the signal
+    (e.g. actual changed files, actual PR merge status) that the caller
+    trusts more than the signal's own self-description — see
+    pipelines/pre_cve.py's `_pipeline_verified_context()`.
     """
     user_prompt = build_user_prompt(
         package=package,
@@ -128,6 +148,7 @@ async def triage_signal(
         signal_type=signal_type,
         signal_url=signal_url,
         signal_content=signal_content,
+        extra_context=extra_context,
     )
 
     raw = await complete("triage", SYSTEM_PROMPT, user_prompt, provider=provider, model=model, llm_config=llm_config)

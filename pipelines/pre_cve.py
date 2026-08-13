@@ -179,37 +179,73 @@ def _issue_to_signal_content(item: dict[str, Any]) -> str:
     return f"{title}\n\n{body}".strip()[:2000]
 
 
-async def _commit_touches_path(
-    client: httpx.AsyncClient, repo: str, sha: str, path_prefix: str, *, token: str
-) -> bool:
+async def _fetch_commit_files(client: httpx.AsyncClient, repo: str, sha: str, *, token: str) -> list[dict[str, Any]]:
     """For monorepo-hosted packages (watchlist.yaml `path_prefix`) — commit
     search results don't include changed files, so this fetches them
     separately. Without this, a commit search scoped to `repo:{repo}` alone
     can match an unrelated sibling package in the same monorepo (e.g. Azure
-    SDK's shared repo) and misattribute it here."""
+    SDK's shared repo) and misattribute it here. Also backs the test-only-
+    change detection below (both need the same file list)."""
     resp = await request_with_retry(
         client, "GET", f"https://api.github.com/repos/{repo}/commits/{sha}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
     )
-    if resp is None:
-        return False
-    files = resp.json().get("files", [])
-    return any(f.get("filename", "").startswith(path_prefix) for f in files)
+    return resp.json().get("files", []) if resp is not None else []
 
 
-async def _pr_touches_path(
-    client: httpx.AsyncClient, repo: str, number: int, path_prefix: str, *, token: str
-) -> bool:
-    """PR counterpart to _commit_touches_path() — same reasoning."""
+async def _fetch_pr_files(client: httpx.AsyncClient, repo: str, number: int, *, token: str) -> list[dict[str, Any]]:
+    """PR counterpart to _fetch_commit_files() — same reasoning."""
     resp = await request_with_retry(
         client, "GET", f"https://api.github.com/repos/{repo}/pulls/{number}/files",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
         params={"per_page": 100},
     )
-    if resp is None:
-        return False
-    files = resp.json()
+    return resp.json() if resp is not None else []
+
+
+def _files_touch_path(files: list[dict[str, Any]], path_prefix: str) -> bool:
     return any(f.get("filename", "").startswith(path_prefix) for f in files)
+
+
+# A change whose diff is entirely under a test/spec path is weak evidence of
+# a live, currently-exploitable vulnerability — it's often either a fix
+# regression-guard on code that already behaves safely, or a demonstration
+# with no accompanying production fix. Triage was seeing these read as
+# strong evidence purely from the PR/commit *prose* (which can talk at
+# length about "vulnerabilities" and "probes" while the diff itself touches
+# nothing but tests/) — see the langflow SQL-logging false positive this
+# guards against. Matches "tests/"/"test/" path segments and common
+# test-file-naming conventions (test_x.py, x_test.py, x.test.ts, x.spec.ts).
+_TEST_PATH_RE = re.compile(r"(^|/)tests?(/|_|$)|_test\.|\.test\.|\.spec\.", re.IGNORECASE)
+
+
+def _looks_like_test_path(path: str) -> bool:
+    return bool(_TEST_PATH_RE.search(path))
+
+
+def _files_are_test_only(files: list[dict[str, Any]]) -> bool:
+    return bool(files) and all(_looks_like_test_path(f.get("filename", "")) for f in files)
+
+
+def _pipeline_verified_context(
+    *, files: list[dict[str, Any]] | None = None, pr_merged: bool | None = None
+) -> str | None:
+    """Facts the pipeline itself fetched and can vouch for — passed to
+    triage_signal() separately from the signal's own (untrusted) prose, so
+    the LLM can weigh a signal's self-description against what's actually
+    true of the change. None of this is optional context for the model to
+    take or leave; build_user_prompt() frames it as authoritative."""
+    notes: list[str] = []
+    if pr_merged is not None:
+        notes.append(f"PR merge status: {'merged' if pr_merged else 'still open/unmerged'}.")
+    if files:
+        test_only = _files_are_test_only(files)
+        notes.append(
+            f"Changed files ({len(files)}): {', '.join(f.get('filename', '?') for f in files[:15])}"
+            f"{' …and more' if len(files) > 15 else ''}. "
+            f"{'All changed files are under a test/spec path — this diff does not modify production code.' if test_only else ''}"
+        )
+    return " ".join(n for n in notes if n) or None
 
 
 def _issue_mentions_path_component(item: dict[str, Any], path_prefix: str) -> bool:
@@ -414,6 +450,7 @@ async def run_pre_cve_pipeline(
         signal_type: str,
         signal_content: str,
         commit_sha: str | None = None,
+        extra_context: str | None = None,
     ) -> bool:
         """Returns True iff a new finding was persisted — lets callers count
         per-package findings without racing the shared result.findings_new
@@ -459,6 +496,7 @@ async def run_pre_cve_pipeline(
             signal_type=signal_type,
             signal_url=signal_url,
             signal_content=signal_content,
+            extra_context=extra_context,
             provider=llm_provider,
             model=llm_model,
         )
@@ -487,8 +525,9 @@ async def run_pre_cve_pipeline(
         signal_url = item.get("html_url")
         if not sha or not signal_url:
             return False
+        files = await _fetch_commit_files(client, pkg["repo"], sha, token=github_token)
         path_prefix = pkg.get("path_prefix")
-        if path_prefix and not await _commit_touches_path(client, pkg["repo"], sha, path_prefix, token=github_token):
+        if path_prefix and not _files_touch_path(files, path_prefix):
             return False
         return await handle_signal(
             client,
@@ -499,6 +538,7 @@ async def run_pre_cve_pipeline(
             signal_type="commit",
             signal_content=_commit_to_signal_content(item),
             commit_sha=sha,
+            extra_context=_pipeline_verified_context(files=files),
         )
 
     async def process_issue(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> bool:
@@ -520,12 +560,14 @@ async def run_pre_cve_pipeline(
 
     async def process_pr(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> bool:
         signal_url = item.get("html_url")
-        if not signal_url:
-            return False
-        path_prefix = pkg.get("path_prefix")
         number = item.get("number")
-        if path_prefix and number and not await _pr_touches_path(client, pkg["repo"], number, path_prefix, token=github_token):
+        if not signal_url or not number:
             return False
+        files = await _fetch_pr_files(client, pkg["repo"], number, token=github_token)
+        path_prefix = pkg.get("path_prefix")
+        if path_prefix and not _files_touch_path(files, path_prefix):
+            return False
+        pr_merged = (item.get("pull_request") or {}).get("merged_at") is not None
         return await handle_signal(
             client,
             pkg,
@@ -534,6 +576,7 @@ async def run_pre_cve_pipeline(
             summary_text=item.get("title", ""),
             signal_type="pull_request",
             signal_content=_issue_to_signal_content(item),
+            extra_context=_pipeline_verified_context(files=files, pr_merged=pr_merged),
         )
 
     async def process_hn(client: httpx.AsyncClient, pkg: dict[str, Any], hit: dict[str, Any]) -> bool:

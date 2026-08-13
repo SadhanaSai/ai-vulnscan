@@ -321,6 +321,105 @@ async def test_pipeline_skips_disabled_and_repo_less_packages(tmp_path, monkeypa
     assert called == ["org/a"]
 
 
+# --- test-only-change detection (langflow SQL-logging false positive guard) -----
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("tests/unit/test_x.py", True),
+        ("src/backend/tests/unit/services/telemetry/test_dependency_spans.py", True),
+        ("test_foo.py", True),
+        ("foo_test.py", True),
+        ("foo.test.ts", True),
+        ("foo.spec.ts", True),
+        ("src/backend/observability.py", False),
+        ("testament.py", False),  # must not false-positive on words merely starting with "test"
+        ("src/latest/handler.py", False),
+    ],
+)
+def test_looks_like_test_path(path, expected):
+    assert pre_cve._looks_like_test_path(path) is expected
+
+
+def test_files_are_test_only_true_when_every_file_is_a_test():
+    files = [{"filename": "tests/test_a.py"}, {"filename": "tests/test_b.py"}]
+    assert pre_cve._files_are_test_only(files) is True
+
+
+def test_files_are_test_only_false_when_any_production_file_present():
+    files = [{"filename": "tests/test_a.py"}, {"filename": "src/observability.py"}]
+    assert pre_cve._files_are_test_only(files) is False
+
+
+def test_files_are_test_only_false_when_no_files():
+    assert pre_cve._files_are_test_only([]) is False
+
+
+def test_pipeline_verified_context_none_when_nothing_given():
+    assert pre_cve._pipeline_verified_context() is None
+
+
+def test_pipeline_verified_context_flags_test_only_files():
+    context = pre_cve._pipeline_verified_context(files=[{"filename": "tests/test_a.py"}])
+    assert "does not modify production code" in context
+
+
+def test_pipeline_verified_context_silent_on_production_files():
+    context = pre_cve._pipeline_verified_context(files=[{"filename": "src/observability.py"}])
+    assert "does not modify production code" not in context
+    assert "observability.py" in context
+
+
+def test_pipeline_verified_context_includes_merge_status():
+    assert "still open/unmerged" in pre_cve._pipeline_verified_context(pr_merged=False)
+    assert "merged" in pre_cve._pipeline_verified_context(pr_merged=True)
+
+
+def _pr_item(number: int, title: str = "some PR", merged: bool = False) -> dict:
+    return {
+        "number": number,
+        "html_url": f"https://github.com/org/repo/pull/{number}",
+        "title": title,
+        "body": "details",
+        "pull_request": {"merged_at": "2026-01-01T00:00:00Z" if merged else None},
+    }
+
+
+@pytest.mark.asyncio
+async def test_pr_signal_gets_test_only_and_merge_status_context(tmp_path, monkeypatch):
+    """Regression test for the langflow SQL-logging false positive: an
+    unmerged PR whose diff is entirely test files must reach triage_signal
+    with that context attached, not just the PR's own prose."""
+
+    async def fake_search_prs(*args, **kwargs):
+        return [_pr_item(14526, title="test(observability): run the claims", merged=False)]
+
+    async def fake_fetch_pr_files(client, repo, number, *, token):
+        return [{"filename": "src/backend/tests/unit/services/telemetry/test_dependency_spans.py"}]
+
+    async def fake_crosscheck(*args, **kwargs):
+        return None
+
+    captured = {}
+
+    async def fake_triage(*args, **kwargs):
+        captured["extra_context"] = kwargs.get("extra_context")
+        return {"lane": "3", "summary": "test-only change", "validation_steps": []}
+
+    monkeypatch.setattr(pre_cve, "search_security_prs", fake_search_prs)
+    monkeypatch.setattr(pre_cve, "_fetch_pr_files", fake_fetch_pr_files)
+    monkeypatch.setattr(pre_cve, "cross_check_existing_cve", fake_crosscheck)
+    monkeypatch.setattr(pre_cve, "triage_signal", fake_triage)
+
+    database = db.get_db(tmp_path / "test.db")
+    await pre_cve.run_pre_cve_pipeline([_package()], db=database, github_token="tok")
+
+    assert captured["extra_context"] is not None
+    assert "still open/unmerged" in captured["extra_context"]
+    assert "does not modify production code" in captured["extra_context"]
+
+
 # --- issue / PR search --------------------------------------------------------
 
 

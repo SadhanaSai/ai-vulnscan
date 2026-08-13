@@ -30,6 +30,35 @@ def _triage_json(**overrides) -> str:
     return json.dumps(data)
 
 
+# --- build_user_prompt() extra_context -----------------------------------------
+
+
+def test_build_user_prompt_includes_extra_context_when_provided():
+    prompt = classifier.build_user_prompt(
+        package="somepkg",
+        layer="framework",
+        agentic_context=None,
+        signal_type="pull_request",
+        signal_url="https://x",
+        signal_content="some PR body",
+        extra_context="PR merge status: still open/unmerged.",
+    )
+    assert "Pipeline-verified context" in prompt
+    assert "still open/unmerged" in prompt
+
+
+def test_build_user_prompt_omits_context_block_when_absent():
+    prompt = classifier.build_user_prompt(
+        package="somepkg",
+        layer="framework",
+        agentic_context=None,
+        signal_type="commit",
+        signal_url="https://x",
+        signal_content="some commit message",
+    )
+    assert "Pipeline-verified context" not in prompt
+
+
 # --- parsing / schema validation --------------------------------------------
 
 
