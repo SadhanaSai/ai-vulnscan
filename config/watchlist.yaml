@@ -157,6 +157,15 @@ packages:
     path_prefix: sdk/ai/azure-ai-inference/
     agentic_context: null
     enabled: true
+  - name: claude-agent-sdk
+    ecosystem: pypi
+    layer: sdk
+    # Public repo, real src/ tree (confirmed 2026-08-30, unlike anthropics/
+    # claude-code below). Bundles the Claude Code CLI runtime and supports
+    # in-process custom MCP tools.
+    repo: anthropics/claude-agent-sdk-python
+    agentic_context: "Agent-building SDK — tool authorization, default permission scope, subprocess/MCP trust boundaries, local file/workspace isolation are the load-bearing security surfaces"
+    enabled: true
 
   # --- Layer 3: MCP ecosystem ---
   - name: mcp
@@ -327,4 +336,14 @@ packages:
     layer: sdk
     repo: ollama/ollama-js
     agentic_context: "JS client for local Ollama models — Windows build has had an unsigned-update RCE"
+    enabled: true
+  - name: "@anthropic-ai/claude-code-action"
+    ecosystem: npm
+    layer: infrastructure
+    # Not actually published to npm (registry 404, confirmed 2026-08-30) —
+    # consumed via GitHub Action repo-tag reference, not `npm install`.
+    # ecosystem set to npm only to satisfy the schema; Phase 7 version
+    # resolution has no package to pin and will no-op for this entry.
+    repo: anthropics/claude-code-action
+    agentic_context: "GitHub Action running Claude Code in CI against untrusted PR/issue content — action-input injection, token leakage, fork/branch trust confusion are the relevant surfaces"
     enabled: true
