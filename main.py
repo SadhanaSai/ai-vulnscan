@@ -287,7 +287,13 @@ def _run_scan(targets: list[dict], *, dry_run: bool, llm_provider: str | None, l
             llm_calls_by_provider={resolved_provider: llm_calls} if pre_cve_result else {},
             duration_seconds=duration,
         )
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: a Ctrl+C (KeyboardInterrupt) or an
+        # external SIGTERM must still mark this run "failed" rather than
+        # leaving it stuck at "running" forever — every finding already
+        # discovered is already committed (upsert_finding()/upsert_pattern()
+        # each commit individually, not batched), only this run's own
+        # status bookkeeping needs the wider catch.
         if run_id is not None:
             finish_scan_run(db, run_id, status="failed")
         raise
