@@ -24,13 +24,22 @@ DEFAULT_LIBRARY_PATH = PROJECT_ROOT / "patterns" / "library.json"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS findings (
     id TEXT PRIMARY KEY,
-    package TEXT NOT NULL,
-    ecosystem TEXT NOT NULL,
-    layer TEXT NOT NULL,
-    source TEXT NOT NULL,
+    -- package/ecosystem/layer/source/lane/first_seen/last_checked are
+    -- required in practice (Finding is a dataclass with no default for
+    -- any of them) but are deliberately NOT declared NOT NULL here:
+    -- upsert_finding() goes through sqlite_utils' upsert(), which writes
+    -- new rows as `INSERT OR IGNORE INTO findings(id) VALUES (...)`
+    -- followed by an UPDATE — a NOT NULL constraint on any other column
+    -- makes that first insert silently fail (OR IGNORE swallows the
+    -- constraint violation) and the finding is never persisted. Column
+    -- presence is enforced at the Finding dataclass boundary instead.
+    package TEXT,
+    ecosystem TEXT,
+    layer TEXT,
+    source TEXT,
     signal_url TEXT,
     summary TEXT,
-    lane TEXT NOT NULL,
+    lane TEXT,
     severity TEXT,
     cvss REAL,
     cwe TEXT,               -- JSON array as text
@@ -38,8 +47,8 @@ CREATE TABLE IF NOT EXISTS findings (
     cve_id TEXT,
     agentic_uplift TEXT,
     validation_steps TEXT,  -- JSON array as text; required (non-null) for lane 1A/1B
-    first_seen TEXT NOT NULL,
-    last_checked TEXT NOT NULL,
+    first_seen TEXT,
+    last_checked TEXT,
     last_cve_crosscheck TEXT,
     disclosure_deadline TEXT,
     status TEXT NOT NULL DEFAULT 'new',
@@ -50,7 +59,10 @@ CREATE TABLE IF NOT EXISTS findings (
 
 CREATE TABLE IF NOT EXISTS patterns (
     id TEXT PRIMARY KEY,
-    vulnerability_class TEXT NOT NULL,
+    -- Same reasoning as findings above: no NOT NULL on columns without a
+    -- DEFAULT, since upsert_pattern() goes through the same sqlite_utils
+    -- upsert() insert-or-ignore-then-update path.
+    vulnerability_class TEXT,
     layer TEXT,
     trigger_desc TEXT,
     vulnerable_shape TEXT,
@@ -62,13 +74,14 @@ CREATE TABLE IF NOT EXISTS patterns (
     source_commit_url TEXT,
     confirmed_hits TEXT,
     false_positives INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL,
-    last_updated TEXT NOT NULL
+    created_at TEXT,
+    last_updated TEXT
 );
 
 CREATE TABLE IF NOT EXISTS watch_queue (
     finding_id TEXT PRIMARY KEY,
-    next_check TEXT NOT NULL,
+    -- Same reasoning again: schedule_watch_check()/bump_watch_check() upsert.
+    next_check TEXT,
     check_count INTEGER DEFAULT 0,
     FOREIGN KEY (finding_id) REFERENCES findings(id)
 );
