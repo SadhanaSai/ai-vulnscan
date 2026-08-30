@@ -113,7 +113,9 @@ def scan_status(run_id_opt: int | None) -> None:
     for p in progress:
         by_phase.setdefault(p.phase, []).append(p)
 
-    for phase in ("known_cve", "pre_cve"):
+    # known_cve/pre_cve/pattern_hunt are all bounded to this run's targeted
+    # packages, so "pending" (packages_total - rows seen) is meaningful.
+    for phase in ("known_cve", "pre_cve", "pattern_hunt"):
         rows = by_phase.get(phase, [])
         done = [r for r in rows if r.status == "done"]
         errored = [r for r in rows if r.status == "error"]
@@ -121,6 +123,18 @@ def scan_status(run_id_opt: int | None) -> None:
         console.print(
             f"  {phase}: {len(done)} done, {len(errored)} errored, {pending} pending "
             f"(of {run.packages_total} targeted)"
+        )
+
+    # pattern_extraction scans the whole Lane 1 commit-finding backlog, not
+    # just this run's targeted packages — a "pending of packages_total"
+    # count would be meaningless here, so it's reported without one.
+    pe_rows = by_phase.get("pattern_extraction", [])
+    if pe_rows:
+        pe_done = [r for r in pe_rows if r.status == "done"]
+        pe_errored = [r for r in pe_rows if r.status == "error"]
+        console.print(
+            f"  pattern_extraction: {len(pe_done)} package(s) done, {len(pe_errored)} errored "
+            "(scoped to the full Lane 1 commit-finding backlog, not just targeted packages)"
         )
 
     errored = [p for p in progress if p.status == "error"]
@@ -264,6 +278,7 @@ def _run_scan(targets: list[dict], *, dry_run: bool, llm_provider: str | None, l
                         db=db, github_token=github_token, package_to_repo=package_to_repo,
                         package_to_path_prefix=package_to_path_prefix,
                         llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
+                        run_id=run_id,
                     )
                 )
                 if new_patterns:
@@ -272,6 +287,7 @@ def _run_scan(targets: list[dict], *, dry_run: bool, llm_provider: str | None, l
                         run_pattern_hunt(
                             targets, new_patterns, db=db, github_token=github_token,
                             llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
+                            run_id=run_id,
                         )
                     )
 

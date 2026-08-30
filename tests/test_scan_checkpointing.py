@@ -13,6 +13,8 @@ import pytest
 from click.testing import CliRunner
 
 import main as main_module
+from hunter import scanner
+from patterns import extractor
 from pipelines import known_cve, pre_cve
 from state import db
 
@@ -299,6 +301,188 @@ async def test_pre_cve_pipeline_without_run_id_writes_no_checkpoints(tmp_path, m
     assert db.list_scan_progress(database, run_id=1) == []
 
 
+# --- run_pattern_extraction(run_id=...) ---------------------------------------
+
+
+def _commit_finding(**overrides) -> db.Finding:
+    defaults = dict(
+        id="f1",
+        package="somepkg",
+        ecosystem="pypi",
+        layer="mcp",
+        source="github_commit",
+        signal_url="https://github.com/org/repo/commit/abcdef1234567890",
+        summary="fix: sanitize path input",
+        lane="1B",
+        cwe=["CWE-22"],
+    )
+    defaults.update(overrides)
+    return db.Finding(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_pattern_extraction_checkpoints_each_package(tmp_path, monkeypatch):
+    # Note: the real extract_pattern_from_finding() signature names its DB
+    # handle `db` too, shadowing the module-level `db` import inside this
+    # fake's own body — use extractor.Pattern (not db.Pattern) to build the
+    # return value here.
+    async def fake_extract(finding, *, db, github_token, llm_provider=None, llm_model=None, library_path=None, dry_run=False):
+        return extractor.Pattern(id="MCP-X-001", vulnerability_class="x", source_finding_id=finding.id)
+
+    monkeypatch.setattr(extractor, "extract_pattern_from_finding", fake_extract)
+
+    database = db.get_db(tmp_path / "test.db")
+    run = db.start_scan_run(database, db.ScanRun(mode="scan", packages_total=1))
+    db.upsert_finding(database, _commit_finding(id="f1", package="somepkg"))
+
+    extracted = await extractor.run_pattern_extraction(db=database, github_token="tok", run_id=run.id)
+
+    assert len(extracted) == 1
+    progress = db.list_scan_progress(database, run.id)
+    assert len(progress) == 1
+    assert progress[0].package == "somepkg"
+    assert progress[0].phase == "pattern_extraction"
+    assert progress[0].status == "done"
+    assert progress[0].findings_new == 1  # one pattern extracted for this package
+
+
+@pytest.mark.asyncio
+async def test_pattern_extraction_package_level_failure_is_isolated(tmp_path, monkeypatch):
+    async def flaky_extract(finding, *, db, github_token, llm_provider=None, llm_model=None, library_path=None, dry_run=False):
+        if finding.package == "bad-pkg":
+            raise ConnectionError("simulated failure")
+        return None
+
+    monkeypatch.setattr(extractor, "extract_pattern_from_finding", flaky_extract)
+
+    database = db.get_db(tmp_path / "test.db")
+    run = db.start_scan_run(database, db.ScanRun(mode="scan", packages_total=2))
+    db.upsert_finding(database, _commit_finding(id="f-bad", package="bad-pkg"))
+    db.upsert_finding(database, _commit_finding(id="f-good", package="good-pkg", signal_url="https://github.com/org/repo/commit/1111111111111111"))
+
+    await extractor.run_pattern_extraction(db=database, github_token="tok", run_id=run.id)
+
+    progress = {p.package: p for p in db.list_scan_progress(database, run.id)}
+    assert progress["bad-pkg"].status == "error"
+    assert "simulated failure" in progress["bad-pkg"].error
+    assert progress["good-pkg"].status == "done"
+
+
+@pytest.mark.asyncio
+async def test_pattern_extraction_without_run_id_writes_no_checkpoints(tmp_path, monkeypatch):
+    async def fake_extract(finding, *, db, github_token, llm_provider=None, llm_model=None, library_path=None, dry_run=False):
+        return None
+
+    monkeypatch.setattr(extractor, "extract_pattern_from_finding", fake_extract)
+
+    database = db.get_db(tmp_path / "test.db")
+    db.upsert_finding(database, _commit_finding())
+
+    await extractor.run_pattern_extraction(db=database, github_token="tok")
+
+    assert db.list_scan_progress(database, run_id=1) == []
+
+
+# --- run_pattern_hunt(run_id=...) ----------------------------------------------
+
+
+def _hunt_pattern(**overrides) -> db.Pattern:
+    defaults = dict(id="MCP-PATH-TRAVERSAL-001", vulnerability_class="path_traversal", layer="mcp")
+    defaults.update(overrides)
+    return db.Pattern(**defaults)
+
+
+def _hunt_package(name="somepkg", **overrides) -> dict:
+    pkg = {"name": name, "ecosystem": "pypi", "layer": "mcp", "repo": "org/repo", "agentic_context": None, "enabled": True}
+    pkg.update(overrides)
+    return pkg
+
+
+@pytest.mark.asyncio
+async def test_pattern_hunt_checkpoints_each_touched_package(tmp_path, monkeypatch):
+    async def fake_hunt_in_package(pattern, pkg, **kwargs):
+        return []
+
+    monkeypatch.setattr(scanner, "hunt_pattern_in_package", fake_hunt_in_package)
+
+    database = db.get_db(tmp_path / "test.db")
+    run = db.start_scan_run(database, db.ScanRun(mode="scan", packages_total=1))
+    packages = [_hunt_package(name="somepkg")]
+
+    await scanner.run_pattern_hunt(packages, [_hunt_pattern()], db=database, github_token="tok", run_id=run.id)
+
+    progress = db.list_scan_progress(database, run.id)
+    assert len(progress) == 1
+    assert progress[0].package == "somepkg"
+    assert progress[0].phase == "pattern_hunt"
+    assert progress[0].status == "done"
+
+
+@pytest.mark.asyncio
+async def test_pattern_hunt_package_level_failure_is_isolated(tmp_path, monkeypatch):
+    """One package's hunt_pattern_in_package raising must not abort the
+    gather for the other in-flight package — same guarantee as
+    known_cve.py/pre_cve.py's per-package isolation."""
+
+    async def flaky_hunt_in_package(pattern, pkg, **kwargs):
+        if pkg["name"] == "bad-pkg":
+            raise ConnectionError("simulated clone failure")
+        return []
+
+    monkeypatch.setattr(scanner, "hunt_pattern_in_package", flaky_hunt_in_package)
+
+    database = db.get_db(tmp_path / "test.db")
+    run = db.start_scan_run(database, db.ScanRun(mode="scan", packages_total=2))
+    packages = [_hunt_package(name="bad-pkg"), _hunt_package(name="good-pkg")]
+
+    result = await scanner.run_pattern_hunt(packages, [_hunt_pattern()], db=database, github_token="tok", run_id=run.id)
+
+    assert result.scans_run == 1  # only the successful package counted
+    progress = {p.package: p for p in db.list_scan_progress(database, run.id)}
+    assert progress["bad-pkg"].status == "error"
+    assert "simulated clone failure" in progress["bad-pkg"].error
+    assert progress["good-pkg"].status == "done"
+
+
+@pytest.mark.asyncio
+async def test_pattern_hunt_checkpoints_sibling_triggered_package(tmp_path, monkeypatch):
+    """A package only reached via the §8.5 Step 3 sibling-scan trigger
+    (never in the pattern's initial `applicable` list) still gets its own
+    checkpoint row."""
+
+    async def fake_hunt_in_package(pattern, pkg, **kwargs):
+        result = kwargs["result"]
+        if pkg["name"] == "origin-pkg":
+            finding = db.Finding(id="f1", package=pkg["name"], ecosystem="pypi", layer="mcp", source="pattern_hunt", lane="1A")
+            return [finding]
+        return []
+
+    monkeypatch.setattr(scanner, "hunt_pattern_in_package", fake_hunt_in_package)
+
+    database = db.get_db(tmp_path / "test.db")
+    run = db.start_scan_run(database, db.ScanRun(mode="scan", packages_total=2))
+    packages = [_hunt_package(name="origin-pkg", layer="mcp"), _hunt_package(name="sibling-pkg", layer="mcp")]
+
+    await scanner.run_pattern_hunt(packages, [_hunt_pattern(layer="mcp")], db=database, github_token="tok", run_id=run.id)
+
+    progress = {p.package: p for p in db.list_scan_progress(database, run.id)}
+    assert set(progress) == {"origin-pkg", "sibling-pkg"}
+    assert progress["sibling-pkg"].status == "done"
+
+
+@pytest.mark.asyncio
+async def test_pattern_hunt_without_run_id_writes_no_checkpoints(tmp_path, monkeypatch):
+    async def fake_hunt_in_package(pattern, pkg, **kwargs):
+        return []
+
+    monkeypatch.setattr(scanner, "hunt_pattern_in_package", fake_hunt_in_package)
+
+    database = db.get_db(tmp_path / "test.db")
+    await scanner.run_pattern_hunt([_hunt_package()], [_hunt_pattern()], db=database, github_token="tok")
+
+    assert db.list_scan_progress(database, run_id=1) == []
+
+
 # --- main.py scan-status (CliRunner) -----------------------------------------
 
 
@@ -327,6 +511,24 @@ def test_scan_status_shows_latest_run_with_mixed_done_and_error(tmp_path, monkey
     assert "1 done, 1 errored" in result.output
     assert "bar" in result.output
     assert "boom" in result.output
+
+
+def test_scan_status_shows_pattern_extraction_and_pattern_hunt_phases(tmp_path, monkeypatch):
+    database = db.get_db(tmp_path / "test.db")
+    monkeypatch.setattr(main_module, "get_db", lambda: database)
+
+    run = db.start_scan_run(database, db.ScanRun(mode="scan", packages_total=1))
+    db.record_scan_progress(database, db.ScanProgress(run_id=run.id, package="somepkg", phase="pattern_hunt", status="done"))
+    db.record_scan_progress(
+        database, db.ScanProgress(run_id=run.id, package="otherpkg", phase="pattern_extraction", status="error", error="boom")
+    )
+    db.finish_scan_run(database, run.id, status="complete")
+
+    result = CliRunner().invoke(main_module.cli, ["scan-status"])
+    assert result.exit_code == 0
+    assert "pattern_hunt: 1 done, 0 errored" in result.output
+    assert "pattern_extraction: 0 package(s) done, 1 errored" in result.output
+    assert "otherpkg" in result.output  # shows up in the Errored packages table too
 
 
 def test_scan_status_with_explicit_run_id_targets_older_run(tmp_path, monkeypatch):

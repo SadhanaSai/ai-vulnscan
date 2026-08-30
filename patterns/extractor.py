@@ -39,9 +39,11 @@ from pipelines.pre_cve import SECURITY_KEYWORDS
 from state.db import (
     Finding,
     Pattern,
+    ScanProgress,
     export_pattern_library,
     list_findings,
     list_patterns,
+    record_scan_progress,
     upsert_finding,
     upsert_pattern,
 )
@@ -414,6 +416,7 @@ async def run_pattern_extraction(
     llm_model: str | None = None,
     library_path: str | None = None,
     dry_run: bool = False,
+    run_id: int | None = None,
 ) -> list[Pattern]:
     """Extract patterns for every eligible Lane 1 commit-sourced finding
     that doesn't already have one (cve-agent-spec.md §8.4), plus — if
@@ -429,12 +432,32 @@ async def run_pattern_extraction(
     next time" — since nothing is persisted (no pattern_id written back),
     the same candidates will be re-extracted (and re-billed) on the next
     call, dry_run or not. That's intentional: dry_run exists to preview
-    cost/output, not to be a free repeatable no-op."""
+    cost/output, not to be a free repeatable no-op.
+
+    `run_id` (optional): per-package checkpointing, phase="pattern_extraction"
+    (state/db.py ScanProgress) — one row per package touched this call, not
+    per finding, since a package can have several eligible candidates.
+    Unlike known_cve/pre_cve, candidates here aren't bounded to any given
+    set of "targeted" packages (this scans the whole Lane 1 commit backlog
+    plus, optionally, up to MAX_KNOWN_CVE_EXTRACTIONS_PER_RUN known-CVE
+    findings), so `scan-status` reports this phase without a packages_total
+    denominator — see main.py's scan-status command."""
     all_findings = list_findings(db)
     commit_candidates = [
         f for f in all_findings if f.lane in ("1A", "1B") and f.source == "github_commit" and not f.pattern_id
     ]
     extracted: list[Pattern] = []
+    package_errors: dict[str, list[str]] = {}
+    package_new: dict[str, int] = {}
+    package_touched: set[str] = set()
+
+    def _note(package: str, *, pattern: Pattern | None, error: str | None = None) -> None:
+        package_touched.add(package)
+        if error is not None:
+            package_errors.setdefault(package, []).append(error)
+        if pattern is not None:
+            package_new[package] = package_new.get(package, 0) + 1
+
     for finding in commit_candidates:
         try:
             pattern = await extract_pattern_from_finding(
@@ -443,7 +466,9 @@ async def run_pattern_extraction(
             )
         except Exception as exc:
             console.print(f"[yellow]warning:[/yellow] pattern extraction failed for finding {finding.id[:12]}: {exc}")
+            _note(finding.package, pattern=None, error=str(exc)[:500])
             continue
+        _note(finding.package, pattern=pattern)
         if pattern:
             extracted.append(pattern)
 
@@ -462,8 +487,23 @@ async def run_pattern_extraction(
                 )
             except Exception as exc:
                 console.print(f"[yellow]warning:[/yellow] known-CVE pattern extraction failed for finding {finding.id[:12]}: {exc}")
+                _note(finding.package, pattern=None, error=str(exc)[:500])
                 continue
+            _note(finding.package, pattern=pattern)
             if pattern:
                 extracted.append(pattern)
+
+    if run_id is not None and not dry_run:
+        for package in package_touched:
+            errors = package_errors.get(package)
+            record_scan_progress(
+                db,
+                ScanProgress(
+                    run_id=run_id, package=package, phase="pattern_extraction",
+                    status="error" if errors else "done",
+                    findings_new=package_new.get(package, 0),
+                    error="; ".join(errors)[:500] if errors else None,
+                ),
+            )
 
     return extracted

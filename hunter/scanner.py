@@ -33,10 +33,12 @@ from pipelines.known_cve import cross_check_existing_cve
 from state.db import (
     Finding,
     Pattern,
+    ScanProgress,
     make_finding_id,
     now_iso,
     record_pattern_false_positive,
     record_pattern_hit,
+    record_scan_progress,
     upsert_finding,
 )
 from triage.classifier import DISCLOSURE_WINDOW_DAYS
@@ -408,10 +410,20 @@ async def run_pattern_hunt(
     llm_model: str | None = None,
     concurrency: int = 2,  # git clones are heavier than HTTP calls — keep this modest
     dry_run: bool = False,
+    run_id: int | None = None,
 ) -> PatternHuntResult:
     """cve-agent-spec.md §8.5 — hunt every given pattern across every
     applicable enabled package in `packages`, with sibling-layer expansion
-    (Step 3) on any confirmed match, scoped to `packages`."""
+    (Step 3) on any confirmed match, scoped to `packages`.
+
+    `run_id` (optional): per-package checkpointing, phase="pattern_hunt"
+    (state/db.py ScanProgress) — unlike pattern_extraction, this phase *is*
+    bounded to `packages`, so one row per package actually attempted this
+    call (across however many patterns applied to it, including any it was
+    only reached via a sibling-scan trigger) mirrors known_cve/pre_cve's
+    checkpointing model. A package's own (pattern, package) failure is
+    caught here — same reasoning as known_cve.py/pre_cve.py: one package's
+    unhandled failure must not abort asyncio.gather() for the others."""
     result = PatternHuntResult()
     if not patterns:
         return result
@@ -421,6 +433,8 @@ async def run_pattern_hunt(
     targets = [p for p in packages if p.get("enabled", True) and p.get("repo")]
     semaphore = asyncio.Semaphore(concurrency)
     scanned_pairs: set[tuple[str, str]] = set()  # (pattern.id, package_name) — guards cycles across sibling triggers
+    package_errors: dict[str, list[str]] = {}
+    package_findings_new: dict[str, int] = {}
 
     async def scan_one(pattern: Pattern, pkg: dict[str, Any]) -> None:
         key = (pattern.id, pkg["name"])
@@ -429,12 +443,18 @@ async def run_pattern_hunt(
         scanned_pairs.add(key)
         async with semaphore:
             keywords = vuln_classes.get(pattern.vulnerability_class, {}).get("keywords", [])
-            new_findings = await hunt_pattern_in_package(
-                pattern, pkg, db=db, github_token=github_token, keywords=keywords,
-                llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
-                result=result, existing_ids=existing_ids,
-            )
+            try:
+                new_findings = await hunt_pattern_in_package(
+                    pattern, pkg, db=db, github_token=github_token, keywords=keywords,
+                    llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
+                    result=result, existing_ids=existing_ids,
+                )
+            except Exception as exc:
+                console.print(f"[yellow]warning:[/yellow] pattern hunt failed for {pkg['name']!r} against {pattern.id}: {exc}")
+                package_errors.setdefault(pkg["name"], []).append(str(exc)[:500])
+                return
         result.scans_run += 1
+        package_findings_new[pkg["name"]] = package_findings_new.get(pkg["name"], 0) + len(new_findings)
         if any(f.lane == "1A" for f in new_findings):
             # §8.5 Step 3 — sibling scan: same layer, same pattern, every other enabled package.
             siblings = [p for p in targets if p["layer"] == pkg["layer"] and p["name"] != pkg["name"]]
@@ -444,5 +464,19 @@ async def run_pattern_hunt(
         result.patterns_checked += 1
         applicable = [p for p in targets if _pattern_applies_to_package(pattern, p, vuln_classes)]
         await asyncio.gather(*(scan_one(pattern, p) for p in applicable))
+
+    if run_id is not None and not dry_run:
+        touched_packages = {package_name for _pattern_id, package_name in scanned_pairs}
+        for package in touched_packages:
+            errors = package_errors.get(package)
+            record_scan_progress(
+                db,
+                ScanProgress(
+                    run_id=run_id, package=package, phase="pattern_hunt",
+                    status="error" if errors else "done",
+                    findings_new=package_findings_new.get(package, 0),
+                    error="; ".join(errors)[:500] if errors else None,
+                ),
+            )
 
     return result

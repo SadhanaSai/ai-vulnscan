@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS scan_progress (  -- append-only, one row per (run, pa
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER NOT NULL,
     package TEXT NOT NULL,
-    phase TEXT NOT NULL,           -- "known_cve" | "pre_cve"
+    phase TEXT NOT NULL,           -- "known_cve" | "pre_cve" | "pattern_extraction" | "pattern_hunt"
     status TEXT NOT NULL,          -- "done" | "error"
     findings_new INTEGER NOT NULL DEFAULT 0,
     error TEXT,
@@ -294,7 +294,7 @@ class ScanProgress:
 
     run_id: int
     package: str
-    phase: str  # "known_cve" | "pre_cve"
+    phase: str  # "known_cve" | "pre_cve" | "pattern_extraction" | "pattern_hunt"
     status: str  # "done" | "error"
     findings_new: int = 0
     error: str | None = None
