@@ -13,6 +13,16 @@ import pytest
 
 from llm import router
 
+
+@pytest.fixture(autouse=True)
+def _no_groq_pacing(monkeypatch):
+    """complete() paces sequential Groq calls via a module-level singleton
+    rate limiter (GROQ_PACING_SECONDS, 40s) so it doesn't reset between
+    tests — without this, a Groq-dispatch test run after another one in
+    the same session could incur that as a real wall-clock sleep."""
+    monkeypatch.setattr(router, "_groq_rate_limiter", router._RateLimiter(min_interval=0.0))
+
+
 SAMPLE_CONFIG = {
     "llm": {
         "triage": {"provider": "groq", "model": "llama-3.3-70b-versatile"},
@@ -137,6 +147,73 @@ async def test_complete_raises_clear_error_when_claude_key_missing(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         await router.complete("cve_drafting", "sys", "user", llm_config=SAMPLE_CONFIG["llm"])
+
+
+# --- Groq pacing ---------------------------------------------------------------
+
+
+class _SpyLimiter:
+    def __init__(self):
+        self.waits = 0
+
+    async def wait(self):
+        self.waits += 1
+
+
+@pytest.mark.asyncio
+async def test_complete_paces_groq_calls(monkeypatch):
+    monkeypatch.setattr(router, "AsyncOpenAI", _FakeOpenAIClient)
+    monkeypatch.setenv("GROQ_API_KEY", "fake-groq-key")
+    spy = _SpyLimiter()
+    monkeypatch.setattr(router, "_groq_rate_limiter", spy)
+
+    await router.complete("triage", "sys", "user", llm_config=SAMPLE_CONFIG["llm"])
+
+    assert spy.waits == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_does_not_pace_claude_calls(monkeypatch):
+    monkeypatch.setattr(router, "AsyncAnthropic", _FakeAnthropicClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-anthropic-key")
+    spy = _SpyLimiter()
+    monkeypatch.setattr(router, "_groq_rate_limiter", spy)
+
+    await router.complete("cve_drafting", "sys", "user", llm_config=SAMPLE_CONFIG["llm"])
+
+    assert spy.waits == 0  # pacing must only apply to Groq, per the user's instruction
+
+
+@pytest.mark.asyncio
+async def test_complete_does_not_pace_ollama_calls(monkeypatch):
+    monkeypatch.setattr(router, "AsyncOpenAI", _FakeOpenAIClient)
+    spy = _SpyLimiter()
+    monkeypatch.setattr(router, "_groq_rate_limiter", spy)
+
+    await router.complete("triage", "sys", "user", provider="ollama", model="llama3.3", llm_config=SAMPLE_CONFIG["llm"])
+
+    assert spy.waits == 0
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_delays_second_call_within_interval():
+    import time
+
+    limiter = router._RateLimiter(min_interval=0.05)
+    start = time.monotonic()
+    await limiter.wait()
+    await limiter.wait()
+    assert time.monotonic() - start >= 0.05
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_does_not_delay_first_call():
+    import time
+
+    limiter = router._RateLimiter(min_interval=10.0)
+    start = time.monotonic()
+    await limiter.wait()
+    assert time.monotonic() - start < 1.0  # first call never waits
 
 
 # --- retry logic -------------------------------------------------------------

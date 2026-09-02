@@ -165,6 +165,7 @@ activemq-data/
 
 # Environments
 .env
+manual_validation/.env
 .envrc
 .venv
 env/

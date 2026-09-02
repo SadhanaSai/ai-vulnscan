@@ -17,8 +17,10 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
+from audit.reviewer import load_audit_checklist, run_audit
 from hunter.scanner import run_pattern_hunt
 from llm.router import missing_api_key, resolve_provider_model
+from output.audit_reporter import generate_audit_report, write_audit_report
 from output.cve_drafter import run_cve_drafting
 from output.reporter import generate_report, write_report
 from patterns.extractor import run_pattern_extraction
@@ -50,6 +52,8 @@ from validation.version_resolution import resolve_version
 
 load_dotenv()
 console = Console()
+
+AUDIT_AREAS = sorted(load_audit_checklist())
 
 
 def _filter_packages(packages: list[dict], names: tuple[str, ...], layer: str | None) -> list[dict]:
@@ -560,6 +564,70 @@ def validate(
         outcome.result, "white"
     )
     console.print(f"[{color}]{outcome.result}[/{color}]: {outcome.summary}")
+
+
+@cli.command()
+@click.option("--repo", required=True, help="GitHub org/repo to audit, e.g. org/repo")
+@click.option("--ecosystem", type=click.Choice(["pypi", "npm"]), required=True)
+@click.option(
+    "--areas", "area_names", multiple=True, type=click.Choice(AUDIT_AREAS),
+    help="Specific checklist area(s) to check (repeatable) — see config/audit_checklist.yaml",
+)
+@click.option("--all", "all_areas", is_flag=True, help="Check every area in config/audit_checklist.yaml")
+@click.option("--output", "output_path", default=None, help="Report output path (default: reports/audit-{org}-{repo}-YYYY-MM-DD.md)")
+@click.option("--dry-run", is_flag=True, help="Run the audit but do not write audit_runs rows")
+@click.option("--llm-provider", "llm_provider", default=None, help="Override the agentic_audit LLM provider for this run")
+@click.option("--llm-model", "llm_model", default=None, help="Override the agentic_audit LLM model for this run")
+def audit(
+    repo: str,
+    ecosystem: str,
+    area_names: tuple[str, ...],
+    all_areas: bool,
+    output_path: str | None,
+    dry_run: bool,
+    llm_provider: str | None,
+    llm_model: str | None,
+) -> None:
+    """Standalone agentic-tooling security-posture audit (config/audit_checklist.yaml)
+    against a repo's source. Clone -> read -> delete; never touches Finding/
+    lane/status/disclosure — informational only, same precedent as Phase 7
+    dynamic validation (cve-agent-spec.md §8.8)."""
+    if not area_names and not all_areas:
+        console.print("[red]error:[/red] specify --areas <area> (repeatable) or --all.")
+        raise SystemExit(1)
+    areas = AUDIT_AREAS if all_areas else list(area_names)
+
+    try:
+        provider, _ = resolve_provider_model("agentic_audit", provider=llm_provider, model=llm_model)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise SystemExit(1)
+    missing_env = missing_api_key(provider)
+    if missing_env:
+        console.print(f"[red]error:[/red] {missing_env} not set for agentic_audit provider {provider!r} — cannot run audit.")
+        raise SystemExit(1)
+
+    db = get_db()
+    console.print(f"Auditing {repo} against {len(areas)} area(s)...")
+    result = asyncio.run(
+        run_audit(
+            repo=repo, ecosystem=ecosystem, areas=areas, db=db,
+            llm_provider=llm_provider, llm_model=llm_model, dry_run=dry_run,
+        )
+    )
+
+    color_by_verdict = {
+        "CONFIRMED_CONCERN": "red", "LIKELY_BY_DESIGN": "yellow",
+        "NOT_FOUND": "green", "OUT_OF_SCOPE": "white", "ERROR": "yellow",
+    }
+    for run in result.runs:
+        color = color_by_verdict.get(run.verdict, "white")
+        console.print(f"  {run.area:<28} [{color}]{run.verdict}[/{color}]")
+
+    content = generate_audit_report(repo, ecosystem, result.runs)
+    path = write_audit_report(content, repo, output_path)
+    suffix = " (dry run — not written to database)" if dry_run else ""
+    console.print(f"[green]Report written to[/green] {path}{suffix}")
 
 
 @cli.command()

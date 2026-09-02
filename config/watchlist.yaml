@@ -106,6 +106,12 @@ packages:
     repo: langflow-ai/langflow
     agentic_context: null
     enabled: true
+  - name: langfun
+    ecosystem: pypi
+    layer: framework
+    repo: google/langfun
+    agentic_context: "OO framework for LLM programming, prompt structuring"
+    enabled: true
 
   # --- Layer 2: AI SDKs and clients ---
   - name: anthropic

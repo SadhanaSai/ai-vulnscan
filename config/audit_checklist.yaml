@@ -1,0 +1,72 @@
+# Agentic-tooling security audit checklist — used by `python main.py audit`.
+#
+# Distinct from this file's sibling scan_config.yaml `vulnerability_classes`:
+# those are CWE-shaped patterns hunted for via confirmed-fix pattern matching
+# against a package's source (Phase 5, hunter/scanner.py). These are
+# architectural security-posture questions specific to agent/LLM-tool SDKs
+# and MCP-based tooling — a CONFIRMED_CONCERN here is not automatically
+# CVE-worthy (it can be a documented, opt-in tradeoff), which is why `audit`
+# never touches Finding/lane/status/disclosure — same precedent as Phase 7
+# dynamic validation being informational-only.
+#
+# `keywords` pre-filter which source files get sent to the LLM for a given
+# area (audit/reviewer.py) — kept cheap and file-scoped, same reasoning as
+# the pattern hunter's own AST/regex pre-filter: bound LLM cost, and only
+# ever narrow what's *sent*, never fabricate what's *found*. An area with
+# zero keyword-matching files in a given repo is reported OUT_OF_SCOPE
+# without an LLM call — nothing to review is not the same as "reviewed,
+# nothing found".
+
+areas:
+  tool_authorization:
+    question: >
+      Are tool calls (custom tools and MCP tools) actually authorized or
+      permission-checked before they execute, or trusted implicitly once
+      registered? Is there a single, well-defined enforcement point, or can
+      a caller construct a path that skips it?
+    keywords: ["can_use_tool", "permission", "authoriz", "tool_use", "allowed_tools", "denied_tools"]
+
+  unsafe_default_permissions:
+    question: >
+      What is the default permission/trust mode when a caller doesn't
+      configure one explicitly — does it default to allow-all/bypass rather
+      than deny-by-default or prompt-before-acting?
+    keywords: ["permission_mode", "bypasspermissions", "default_permission", "accept_edits", "auto_approve"]
+
+  path_traversal:
+    question: >
+      Does any file read/write/workspace-path handling join or resolve a
+      caller- or model-controlled path segment without normalizing and
+      containment-checking it against an intended root directory?
+    keywords: ["path", "join", "resolve", "traversal", "realpath", "os.path", "pathlib"]
+
+  token_exposure:
+    question: >
+      How are API keys/tokens/credentials handled — do they ever land in
+      logs, error messages, subprocess argv (visible via `ps`/`/proc`), or
+      get passed into a child process's environment more broadly than
+      necessary?
+    keywords: ["token", "api_key", "apikey", "authorization", "env", "secret", "credential"]
+
+  subprocess_arg_injection:
+    question: >
+      How does the code spawn subprocesses — is shell=True (or the
+      language-equivalent shell-invoking form) used, are commands
+      string-concatenated, or could an unsanitized argument reach a shell
+      or be parsed as an injected flag by the target program?
+    keywords: ["subprocess", "shell=true", "os.system", "exec(", "spawn", "popen", "child_process"]
+
+  mcp_trust_boundaries:
+    question: >
+      How does the code connect to in-process vs. external MCP servers —
+      is there any differentiated trust or sandboxing, or are all
+      configured MCP servers treated as equally trustworthy with no
+      isolation between them?
+    keywords: ["mcp", "server", "stdio", "sse", "trust"]
+
+  workspace_isolation:
+    question: >
+      Are file operations (tool results, session state, checkpoints,
+      caches) confined to a workspace/cwd boundary, or could a tool/model
+      output cause a write outside it?
+    keywords: ["cwd", "workspace", "tempfile", "mkdtemp", "chdir", "sandbox"]

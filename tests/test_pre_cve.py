@@ -2,9 +2,9 @@
 commits + Phase 3 issues/PRs/HackerNews/dependency cross-reference + watch queue).
 
 No real network calls: search_commits/cross_check_existing_cve/triage_signal
-(and the Phase 3 signal sources, stubbed empty by default below) are
-monkeypatched at the names pre_cve imported them under, same pattern as
-tests/test_known_cve.py's pipeline tests.
+(and the Phase 3 signal sources, plus _fetch_commit_files, stubbed empty by
+default below) are monkeypatched at the names pre_cve imported them under,
+same pattern as tests/test_known_cve.py's pipeline tests.
 """
 
 from __future__ import annotations
@@ -32,7 +32,22 @@ def _stub_phase3_signal_sources(monkeypatch):
     """Existing commit-only tests shouldn't need to know about the Phase 3
     signal sources — default them to empty so run_pre_cve_pipeline exercises
     only what each test actually sets up. Tests targeting these sources
-    directly use the _real_* references above instead of pre_cve.<name>."""
+    directly use the _real_* references above instead of pre_cve.<name>.
+
+    _fetch_commit_files is stubbed here too, even though it's a Phase 2
+    helper: unlike search_security_prs (blanket-stubbed, so _fetch_pr_files
+    only runs when a test explicitly opts in), search_commits is NOT part
+    of this blanket stub — tests set it directly to return real-looking
+    commit items — so process_commit() calls the real, unmocked
+    _fetch_commit_files for every one of those items regardless. That was a
+    real bug, not hypothetical: it made genuine network calls to
+    api.github.com in every test that provided commit data, each one
+    failing with a real 401 and paying real network latency — confirmed by
+    tracing a ~70s full-suite slowdown down to exactly this call site.
+    No test here exercises path_prefix filtering, so an empty default is
+    safe; a test that needs specific file data overrides this explicitly,
+    same as test_pr_signal_gets_test_only_and_merge_status_context does
+    for _fetch_pr_files."""
 
     async def _empty(*args, **kwargs):
         return []
@@ -41,6 +56,7 @@ def _stub_phase3_signal_sources(monkeypatch):
     monkeypatch.setattr(pre_cve, "search_security_prs", _empty)
     monkeypatch.setattr(pre_cve, "search_hackernews", _empty)
     monkeypatch.setattr(pre_cve, "scan_dependency_exposure", _empty)
+    monkeypatch.setattr(pre_cve, "_fetch_commit_files", _empty)
 
 
 def _commit_item(sha: str, message: str = "fix: sanitize path input") -> dict:
@@ -392,6 +408,9 @@ async def test_pr_signal_gets_test_only_and_merge_status_context(tmp_path, monke
     unmerged PR whose diff is entirely test files must reach triage_signal
     with that context attached, not just the PR's own prose."""
 
+    async def fake_search_commits(*args, **kwargs):
+        return []
+
     async def fake_search_prs(*args, **kwargs):
         return [_pr_item(14526, title="test(observability): run the claims", merged=False)]
 
@@ -407,6 +426,15 @@ async def test_pr_signal_gets_test_only_and_merge_status_context(tmp_path, monke
         captured["extra_context"] = kwargs.get("extra_context")
         return {"lane": "3", "summary": "test-only change", "validation_steps": []}
 
+    # search_commits isn't covered by the autouse Phase 3 stub above (it's
+    # a Phase 2 source) — without mocking it here too, this test made a
+    # real, unmocked call to api.github.com on every run: real network I/O,
+    # a real 401 from the fake "tok" token, and real rate-limiter waits
+    # between the Phase 2/3 calls it does still make. That was the actual
+    # source of a ~60s full-suite slowdown misattributed to unrelated work
+    # earlier — confirmed by tracing which call site triggered a real
+    # asyncio.sleep() well past what any mock in this test should allow.
+    monkeypatch.setattr(pre_cve, "search_commits", fake_search_commits)
     monkeypatch.setattr(pre_cve, "search_security_prs", fake_search_prs)
     monkeypatch.setattr(pre_cve, "_fetch_pr_files", fake_fetch_pr_files)
     monkeypatch.setattr(pre_cve, "cross_check_existing_cve", fake_crosscheck)

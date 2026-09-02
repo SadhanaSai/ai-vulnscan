@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,45 @@ REQUIRED_ENV_VAR = {
     "claude": "ANTHROPIC_API_KEY",
     "ollama": None,  # local, no auth
 }
+
+
+class _RateLimiter:
+    """Serializes calls with a minimum interval between them. Small,
+    private, and deliberately not the pipelines/http_utils.py RateLimiter
+    of the same shape — llm/router.py is a foundational module other
+    pipelines depend on, so it shouldn't gain a dependency running the
+    other direction."""
+
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._lock = asyncio.Lock()
+        self._last_call = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            remaining = self.min_interval - (now - self._last_call)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            self._last_call = time.monotonic()
+
+
+# Groq's on-demand/free tier caps out at a small per-minute token budget
+# (8000 TPM at the tier this project has been run against) — comfortably
+# exceeded by sequential calls from any phase, not just one. Confirmed by
+# real runs of `python main.py audit` against anthropics/claude-agent-sdk-
+# python (2026-08-30): individual 413s from oversized single requests, and
+# 429s from simple accumulation even after requests were shrunk — a 12s
+# gap between calls still ended up sustaining ~17-20k TPM, well over the
+# cap. 40s keeps sustained throughput to ~1.5 calls/minute with margin.
+#
+# Every phase that can route to Groq (triage, pattern_extraction,
+# pattern_hunt, cve_drafting, agentic_audit) shares this one limiter, gated
+# on provider == "groq" only — Claude/Ollama calls are unaffected, since
+# only Groq's tier is this constrained. Centralized here rather than in
+# each pipeline module, so no caller has to remember to add it themselves.
+GROQ_PACING_SECONDS = 40.0
+_groq_rate_limiter = _RateLimiter(min_interval=GROQ_PACING_SECONDS)
 
 
 def load_llm_config(path: str | Path = DEFAULT_SCAN_CONFIG_PATH) -> dict[str, Any]:
@@ -133,6 +173,7 @@ async def complete(
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
             raise RuntimeError(f"GROQ_API_KEY is not set but phase {phase!r} is configured for provider 'groq'")
+        await _groq_rate_limiter.wait()
         return await _with_retry(lambda: _call_openai_compatible(GROQ_BASE_URL, api_key, resolved_model, system_prompt, user_prompt))
 
     # ollama — local, no auth required

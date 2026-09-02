@@ -120,6 +120,17 @@ CREATE TABLE IF NOT EXISTS dynamic_validation_runs (  -- Phase 7, §8.7 — appe
     FOREIGN KEY (finding_id) REFERENCES findings(id)
 );
 
+CREATE TABLE IF NOT EXISTS audit_runs (  -- `python main.py audit` — append-only, standalone (never touches findings)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    ecosystem TEXT NOT NULL,
+    area TEXT NOT NULL,        -- config/audit_checklist.yaml area id
+    verdict TEXT NOT NULL,     -- "CONFIRMED_CONCERN" | "LIKELY_BY_DESIGN" | "NOT_FOUND" | "OUT_OF_SCOPE" | "ERROR"
+    evidence TEXT,             -- JSON array of {file, lines, snippet, note}
+    impact TEXT,
+    requested_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS scan_runs (  -- per-package checkpointing for `scan`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mode TEXT NOT NULL,            -- "scan" (matches log_scan's mode values)
@@ -261,6 +272,35 @@ class DynamicValidationRun:
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "DynamicValidationRun":
         return cls(**dict(row))
+
+
+@dataclass
+class AuditRun:
+    """`python main.py audit` — one (repo, area) checklist verdict. Append-
+    only, standalone: never linked to a Finding, never touches lane/status —
+    same reasoning as DynamicValidationRun above. A repo accumulates one row
+    per area per `audit` invocation, not deduped, so history is preserved."""
+
+    repo: str
+    ecosystem: str
+    area: str
+    verdict: str  # "CONFIRMED_CONCERN" | "LIKELY_BY_DESIGN" | "NOT_FOUND" | "OUT_OF_SCOPE" | "ERROR"
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    impact: str | None = None
+    requested_at: str = field(default_factory=now_iso)
+    id: int | None = None
+
+    def to_row(self) -> dict[str, Any]:
+        row = asdict(self)
+        row.pop("id")  # autoincrement — never set explicitly on insert
+        row["evidence"] = json.dumps(row["evidence"])
+        return row
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "AuditRun":
+        row = dict(row)
+        row["evidence"] = json.loads(row["evidence"]) if row.get("evidence") else []
+        return cls(**row)
 
 
 @dataclass
@@ -541,6 +581,42 @@ def all_latest_validation_runs(db: sqlite_utils.Database) -> dict[str, DynamicVa
     latest: dict[str, DynamicValidationRun] = {}
     for row in db["dynamic_validation_runs"].rows_where(order_by="requested_at"):
         latest[row["finding_id"]] = DynamicValidationRun.from_row(row)
+    return latest
+
+
+# --- audit runs (`python main.py audit` — standalone, never touches findings) ---
+
+
+def record_audit_run(db: sqlite_utils.Database, run: AuditRun) -> AuditRun:
+    """Append-only insert — never upsert. Every area checked in an `audit`
+    invocation gets its own row, regardless of verdict."""
+    row_id = db["audit_runs"].insert(run.to_row()).last_pk
+    run.id = row_id
+    return run
+
+
+def list_audit_runs(db: sqlite_utils.Database, *, repo: str | None = None, ecosystem: str | None = None) -> list[AuditRun]:
+    if "audit_runs" not in db.table_names():
+        return []
+    where_clauses: list[str] = []
+    args: list[Any] = []
+    if repo is not None:
+        where_clauses.append("repo = ?")
+        args.append(repo)
+    if ecosystem is not None:
+        where_clauses.append("ecosystem = ?")
+        args.append(ecosystem)
+    where = " AND ".join(where_clauses) if where_clauses else None
+    rows = db["audit_runs"].rows_where(where, args, order_by="requested_at") if where else db["audit_runs"].rows_where(order_by="requested_at")
+    return [AuditRun.from_row(r) for r in rows]
+
+
+def latest_audit_runs_by_area(db: sqlite_utils.Database, *, repo: str, ecosystem: str) -> dict[str, AuditRun]:
+    """One most-recent run per area for this (repo, ecosystem) — backs the
+    audit report without needing to dedupe across the full history."""
+    latest: dict[str, AuditRun] = {}
+    for run in list_audit_runs(db, repo=repo, ecosystem=ecosystem):
+        latest[run.area] = run
     return latest
 
 

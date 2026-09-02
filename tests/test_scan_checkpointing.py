@@ -171,6 +171,13 @@ def _commit_item(sha: str) -> dict:
 
 @pytest.fixture(autouse=True)
 def _stub_phase3_signal_sources(monkeypatch):
+    """Mirrors tests/test_pre_cve.py's fixture of the same name (not shared
+    via conftest.py) — _fetch_commit_files is stubbed here too, since
+    search_commits isn't part of the blanket stub and this file's own
+    fake commit items would otherwise reach the real, unmocked
+    _fetch_commit_files on every test, same real bug found and fixed in
+    test_pre_cve.py."""
+
     async def _empty(*args, **kwargs):
         return []
 
@@ -178,6 +185,7 @@ def _stub_phase3_signal_sources(monkeypatch):
     monkeypatch.setattr(pre_cve, "search_security_prs", _empty)
     monkeypatch.setattr(pre_cve, "search_hackernews", _empty)
     monkeypatch.setattr(pre_cve, "scan_dependency_exposure", _empty)
+    monkeypatch.setattr(pre_cve, "_fetch_commit_files", _empty)
 
 
 @pytest.mark.asyncio

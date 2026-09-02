@@ -61,7 +61,7 @@ vulnerability_classes:
 llm:
   triage: # Phases 2-3
     provider: groq
-    model: llama-3.3-70b-versatile
+    model: openai/gpt-oss-120b
   pattern_extraction: # Phase 4
     provider: claude
     model: claude-sonnet-4-6
@@ -71,5 +71,8 @@ llm:
   cve_drafting: # Phase 6
     provider: claude
     model: claude-sonnet-4-6
+  agentic_audit: # `python main.py audit` — standalone, config/audit_checklist.yaml
+    provider: groq
+    model: openai/gpt-oss-120b
   ollama:
     base_url: http://localhost:11434/v1 # override via OLLAMA_HOST env var
