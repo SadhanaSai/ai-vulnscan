@@ -92,10 +92,17 @@ def _pattern_applies_to_package(pattern: Pattern, pkg: dict[str, Any], vuln_clas
 # --- git clone (CLAUDE.md: clone -> read -> delete) --------------------------
 
 
-async def _clone_repo(repo: str, dest: Path) -> str | None:
-    """Shallow clone; returns the checked-out commit SHA, or None on failure."""
+async def _clone_repo(repo: str, dest: Path, ref: str | None = None) -> str | None:
+    """Shallow clone; returns the checked-out commit SHA, or None on failure.
+    `ref` (a tag or branch name) clones that ref instead of the default
+    branch — used by pipelines/release_check.py's GitHub-tag fallback for
+    packages with no real pypi/npm registry entry."""
+    args = ["git", "clone", "--depth", "1", "--quiet"]
+    if ref:
+        args += ["--branch", ref]
+    args += [f"https://github.com/{repo}.git", str(dest)]
     proc = await asyncio.create_subprocess_exec(
-        "git", "clone", "--depth", "1", "--quiet", f"https://github.com/{repo}.git", str(dest),
+        *args,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
     _, stderr = await proc.communicate()

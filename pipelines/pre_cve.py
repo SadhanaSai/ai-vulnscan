@@ -23,6 +23,7 @@ import httpx
 
 from pipelines.http_utils import RateLimiter, console, request_with_retry
 from pipelines.known_cve import cross_check_existing_cve, query_osv
+from pipelines.release_check import ReleaseCache, build_file_removals, check_pattern_in_release
 from state.db import (
     Finding,
     ScanProgress,
@@ -228,7 +229,10 @@ def _files_are_test_only(files: list[dict[str, Any]]) -> bool:
 
 
 def _pipeline_verified_context(
-    *, files: list[dict[str, Any]] | None = None, pr_merged: bool | None = None
+    *,
+    files: list[dict[str, Any]] | None = None,
+    pr_merged: bool | None = None,
+    release_check_note: str | None = None,
 ) -> str | None:
     """Facts the pipeline itself fetched and can vouch for — passed to
     triage_signal() separately from the signal's own (untrusted) prose, so
@@ -245,6 +249,8 @@ def _pipeline_verified_context(
             f"{' …and more' if len(files) > 15 else ''}. "
             f"{'All changed files are under a test/spec path — this diff does not modify production code.' if test_only else ''}"
         )
+    if release_check_note:
+        notes.append(release_check_note)
     return " ".join(n for n in notes if n) or None
 
 
@@ -437,6 +443,11 @@ async def run_pre_cve_pipeline(
     # finding_id also does double duty as the "already scanned" check, since
     # the lookback window is re-searched in full on every run.
     existing_ids = {row["id"] for row in db["findings"].rows_where(select="id")}
+    # Memoized per (package, ecosystem) for this run — release_check.py's
+    # artifact fetch is otherwise redundant across every commit/PR signal
+    # for the same package (a run can see 10-20+ signals per package).
+    release_cache: ReleaseCache = {}
+    release_warned: set[tuple[str, str]] = set()
 
     targets = [p for p in packages if p.get("enabled", True) and p.get("repo")]
 
@@ -529,6 +540,16 @@ async def run_pre_cve_pipeline(
         path_prefix = pkg.get("path_prefix")
         if path_prefix and not _files_touch_path(files, path_prefix):
             return False
+        release_note = await check_pattern_in_release(
+            client,
+            pkg["name"],
+            pkg["ecosystem"],
+            pkg["repo"],
+            build_file_removals(files),
+            github_token=github_token,
+            cache=release_cache,
+            warned_packages=release_warned,
+        )
         return await handle_signal(
             client,
             pkg,
@@ -538,7 +559,7 @@ async def run_pre_cve_pipeline(
             signal_type="commit",
             signal_content=_commit_to_signal_content(item),
             commit_sha=sha,
-            extra_context=_pipeline_verified_context(files=files),
+            extra_context=_pipeline_verified_context(files=files, release_check_note=release_note),
         )
 
     async def process_issue(client: httpx.AsyncClient, pkg: dict[str, Any], item: dict[str, Any]) -> bool:
@@ -568,6 +589,16 @@ async def run_pre_cve_pipeline(
         if path_prefix and not _files_touch_path(files, path_prefix):
             return False
         pr_merged = (item.get("pull_request") or {}).get("merged_at") is not None
+        release_note = await check_pattern_in_release(
+            client,
+            pkg["name"],
+            pkg["ecosystem"],
+            pkg["repo"],
+            build_file_removals(files),
+            github_token=github_token,
+            cache=release_cache,
+            warned_packages=release_warned,
+        )
         return await handle_signal(
             client,
             pkg,
@@ -576,7 +607,7 @@ async def run_pre_cve_pipeline(
             summary_text=item.get("title", ""),
             signal_type="pull_request",
             signal_content=_issue_to_signal_content(item),
-            extra_context=_pipeline_verified_context(files=files, pr_merged=pr_merged),
+            extra_context=_pipeline_verified_context(files=files, pr_merged=pr_merged, release_check_note=release_note),
         )
 
     async def process_hn(client: httpx.AsyncClient, pkg: dict[str, Any], hit: dict[str, Any]) -> bool:

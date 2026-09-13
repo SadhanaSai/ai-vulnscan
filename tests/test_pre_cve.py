@@ -776,3 +776,72 @@ async def test_watch_queue_lane3_discards_finding_and_queue_entry(tmp_path, monk
     assert result.promoted == 1
     assert db.get_finding(database, finding.id) is None
     assert db.due_watch_items(database, now="9999-01-01T00:00:00+00:00") == []
+
+
+# --- release_check.py wiring --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_commit_signal_release_check_note_reaches_triage(tmp_path, monkeypatch):
+    async def fake_search_commits(*args, **kwargs):
+        return [_commit_item("sha1")]
+
+    async def fake_fetch_commit_files(client, repo, sha, *, token):
+        return [{"filename": "src/pkg/foo.py", "patch": "@@ -1 +1 @@\n-bad()\n+good()\n"}]
+
+    async def fake_crosscheck(*args, **kwargs):
+        return None
+
+    async def fake_release_check(*args, **kwargs):
+        return "Release check against pkg 1.0.0 (latest pypi release): src/pkg/foo.py — pre-fix shape appears present."
+
+    captured = {}
+
+    async def fake_triage(*args, **kwargs):
+        captured["extra_context"] = kwargs.get("extra_context")
+        return {"lane": "3", "summary": "noise", "validation_steps": []}
+
+    monkeypatch.setattr(pre_cve, "search_commits", fake_search_commits)
+    monkeypatch.setattr(pre_cve, "_fetch_commit_files", fake_fetch_commit_files)
+    monkeypatch.setattr(pre_cve, "cross_check_existing_cve", fake_crosscheck)
+    monkeypatch.setattr(pre_cve, "check_pattern_in_release", fake_release_check)
+    monkeypatch.setattr(pre_cve, "triage_signal", fake_triage)
+
+    database = db.get_db(tmp_path / "test.db")
+    await pre_cve.run_pre_cve_pipeline([_package()], db=database, github_token="tok")
+
+    assert captured["extra_context"] is not None
+    assert "pre-fix shape appears present" in captured["extra_context"]
+
+
+@pytest.mark.asyncio
+async def test_release_cache_reused_across_commits_for_same_package(tmp_path, monkeypatch):
+    async def fake_search_commits(*args, **kwargs):
+        return [_commit_item("sha1"), _commit_item("sha2")]
+
+    async def fake_fetch_commit_files(client, repo, sha, *, token):
+        return [{"filename": "src/pkg/foo.py", "patch": "@@ -1 +1 @@\n-bad()\n+good()\n"}]
+
+    async def fake_crosscheck(*args, **kwargs):
+        return None
+
+    async def fake_triage(*args, **kwargs):
+        return {"lane": "3", "summary": "noise", "validation_steps": []}
+
+    seen_caches = []
+
+    async def fake_release_check(client, package, ecosystem, repo, removals, *, github_token, cache, warned_packages):
+        seen_caches.append(cache)
+        return None
+
+    monkeypatch.setattr(pre_cve, "search_commits", fake_search_commits)
+    monkeypatch.setattr(pre_cve, "_fetch_commit_files", fake_fetch_commit_files)
+    monkeypatch.setattr(pre_cve, "cross_check_existing_cve", fake_crosscheck)
+    monkeypatch.setattr(pre_cve, "check_pattern_in_release", fake_release_check)
+    monkeypatch.setattr(pre_cve, "triage_signal", fake_triage)
+
+    database = db.get_db(tmp_path / "test.db")
+    await pre_cve.run_pre_cve_pipeline([_package()], db=database, github_token="tok")
+
+    assert len(seen_caches) == 2
+    assert seen_caches[0] is seen_caches[1]  # same cache object threaded through both signals
